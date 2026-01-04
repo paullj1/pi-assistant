@@ -14,6 +14,10 @@ From GitHub:
 curl -fsSL https://raw.githubusercontent.com/paullj1/pi-assistant/refs/heads/main/install.sh | bash
 ```
 
+## Hardware
+
+Tested with a Raspberry Pi 5 and an EMEET VTC speaker/mic: https://a.co/d/0xx8IFN
+
 ## Config
 
 Config lives at `~/.config/pi-assistant/config.toml` by default (XDG compatible).
