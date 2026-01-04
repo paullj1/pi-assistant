@@ -6,6 +6,10 @@ XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 CONFIG_DIR="$XDG_CONFIG_HOME/pi-assistant"
 SERVICE_DIR="$XDG_CONFIG_HOME/systemd/user"
 SERVICE_PATH="$SERVICE_DIR/pi-assistant.service"
+BIN_PATH="$(command -v pi-assistant || true)"
+if [[ -z "$BIN_PATH" ]]; then
+  BIN_PATH="$HOME/.local/bin/pi-assistant"
+fi
 
 mkdir -p "$CONFIG_DIR"
 mkdir -p "$SERVICE_DIR"
@@ -117,10 +121,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=pi-assistant
+ExecStart=$BIN_PATH
 Restart=on-failure
 RestartSec=2
 Environment=PYTHONUNBUFFERED=1
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 
 [Install]
 WantedBy=default.target

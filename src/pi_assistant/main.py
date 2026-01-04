@@ -14,6 +14,7 @@ Key additions vs earlier version:
   - Optional explicit ALSA playback device for aplay (ASSISTANT_ALSA_PLAYBACK)
 """
 
+import argparse
 import json
 import os
 import queue
@@ -1149,7 +1150,24 @@ def wait_for_wake_word(
 
 
 def main():
-    if _as_bool("ASSISTANT_LIST_DEVICES", False):
+    parser = argparse.ArgumentParser(description="Pi Assistant")
+    parser.add_argument(
+        "--list-devices",
+        action="store_true",
+        help="List available audio input devices and exit.",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging (overrides ASSISTANT_DEBUG).",
+    )
+    args = parser.parse_args()
+
+    global DEBUG
+    if args.debug:
+        DEBUG = True
+
+    if args.list_devices or _as_bool("ASSISTANT_LIST_DEVICES", False):
         print_audio_devices()
         return
 
