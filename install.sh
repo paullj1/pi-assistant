@@ -10,18 +10,103 @@ SERVICE_PATH="$SERVICE_DIR/pi-assistant.service"
 mkdir -p "$CONFIG_DIR"
 mkdir -p "$SERVICE_DIR"
 
-if [[ -f "$ROOT_DIR/mcp.json" ]]; then
-  cp -f "$ROOT_DIR/mcp.json" "$CONFIG_DIR/mcp.json"
+if [[ ! -f "$CONFIG_DIR/mcp.json" ]]; then
+  cat > "$CONFIG_DIR/mcp.json" <<'EOF'
+{
+  "mcpServers": {
+    "ddg-search": {
+      "command": "uvx",
+      "args": ["duckduckgo-mcp-server"]
+    }
+  }
+}
+EOF
 fi
 
-if [[ -f "$ROOT_DIR/config.toml" ]]; then
-  cp -n "$ROOT_DIR/config.toml" "$CONFIG_DIR/config.toml"
+if [[ ! -f "$CONFIG_DIR/config.toml" ]]; then
+  cat > "$CONFIG_DIR/config.toml" <<'EOF'
+[assistant]
+ASSISTANT_API_BASE = "https://gpt.r0b0.dev/v1"
+ASSISTANT_API_KEY = ""
+ASSISTANT_CHAT_MODEL = "gpt-oss:120b"
+ASSISTANT_REASONING_EFFORT = ""
+
+ASSISTANT_TTS_MODEL = "kokoro"
+ASSISTANT_TTS_VOICE = "af_heart"
+ASSISTANT_TTS_FORMAT = "wav"
+ASSISTANT_TTS_CHUNK_CHARS = 220
+
+ASSISTANT_SAMPLE_RATE = 16000
+ASSISTANT_CHANNELS = 1
+
+ASSISTANT_MAX_SECONDS = 12.0
+ASSISTANT_SILENCE_SECONDS = 0.8
+ASSISTANT_RMS_THRESHOLD = 0.010
+
+ASSISTANT_MIC_SOFT_GAIN = 1.0
+ASSISTANT_NOISE_GATE = 0.0
+ASSISTANT_CLIP = true
+
+ASSISTANT_INPUT_DEVICE = ""
+ASSISTANT_ALSA_PLAYBACK = "default"
+
+ASSISTANT_WAKE_CUE = "tts"
+ASSISTANT_WAKE_CUE_TTS = "How can I help you?"
+ASSISTANT_WAKE_BEEP_HZ = 880.0
+ASSISTANT_WAKE_BEEP_MS = 120
+ASSISTANT_WAKE_BEEP_GAIN = 0.2
+ASSISTANT_WAKE_LISTEN_SECONDS = 10.0
+ASSISTANT_WAKE_LISTEN_FULL_WINDOW = true
+
+ASSISTANT_STOP_CUE = "beep"
+ASSISTANT_STOP_CUE_TTS = "Okay."
+ASSISTANT_STOP_BEEP_HZ = 520.0
+ASSISTANT_STOP_BEEP_MS = 120
+ASSISTANT_STOP_BEEP_GAIN = 0.2
+
+ASSISTANT_WORKING_CUE = "beep"
+ASSISTANT_WORKING_CUE_TTS = "One moment."
+ASSISTANT_WORKING_BEEP_HZ = 320.0
+ASSISTANT_WORKING_BEEP_MS = 900
+ASSISTANT_WORKING_BEEP_GAIN = 0.18
+ASSISTANT_WORKING_BEEP_PAUSE_MS = 450
+ASSISTANT_WORKING_BEEP_STYLE = "sequence"
+ASSISTANT_WORKING_BEEP_HZ2 = 380.0
+ASSISTANT_WORKING_BEEP_HZ3 = 450.0
+
+ASSISTANT_DEBUG = false
+
+ASSISTANT_WAKE_WORD = "atlas"
+ASSISTANT_WAKE_PHRASES = ""
+ASSISTANT_WAKE_MAX_SECONDS = 1.97
+ASSISTANT_WAKE_SILENCE_SECONDS = 0.6
+ASSISTANT_WAKE_RMS_THRESHOLD = 0.0005
+ASSISTANT_WAKE_FUZZY_THRESHOLD = 0.6
+ASSISTANT_WAKE_FULL_FUZZY_THRESHOLD = 0.75
+ASSISTANT_WAKE_MIN_TOKEN_LEN = 3
+ASSISTANT_WAKE_WHISPER_MODEL = "tiny.en"
+ASSISTANT_WAKE_MIN_RMS_FOR_STT = 0.001
+
+ASSISTANT_MCP_CONFIG = ""
+ASSISTANT_LIST_DEVICES = false
+EOF
 fi
 
 if command -v uv >/dev/null 2>&1; then
-  uv pip install "$ROOT_DIR"
+  if compgen -G "$ROOT_DIR"/*.whl > /dev/null; then
+    WHEEL_PATH="$(ls -1 "$ROOT_DIR"/*.whl | head -n 1)"
+    uv tool install --force "$WHEEL_PATH"
+  elif [[ -f "$ROOT_DIR/pyproject.toml" ]]; then
+    uv pip install "$ROOT_DIR"
+  else
+    uv tool install --force "git+https://github.com/paullj1/pi-assistant"
+  fi
 else
-  python3 -m pip install "$ROOT_DIR"
+  if [[ -f "$ROOT_DIR/pyproject.toml" ]]; then
+    python3 -m pip install "$ROOT_DIR"
+  else
+    python3 -m pip install "git+https://github.com/paullj1/pi-assistant"
+  fi
 fi
 
 cat > "$SERVICE_PATH" <<'EOF'
