@@ -105,7 +105,7 @@ def _as_bool(key: str, default: bool) -> bool:
 API_BASE = _as_str("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 API_KEY = _as_str("OPENAI_API_KEY", "")
 
-CHAT_MODEL = _as_str("ASSISTANT_CHAT_MODEL", "gpt-oss:120b")
+CHAT_MODEL = _as_str("OPENAI_MODEL", "gpt-oss:120b")
 REASONING_EFFORT = _as_str("ASSISTANT_REASONING_EFFORT", "").strip()
 
 TTS_MODEL = _as_str("ASSISTANT_TTS_MODEL", "tts-1")

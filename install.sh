@@ -26,9 +26,9 @@ fi
 if [[ ! -f "$CONFIG_DIR/config.toml" ]]; then
   cat > "$CONFIG_DIR/config.toml" <<'EOF'
 [assistant]
-ASSISTANT_API_BASE = "https://api.openai.com/v1"
-ASSISTANT_API_KEY = ""
-ASSISTANT_CHAT_MODEL = "gpt-5.2"
+OPENAI_BASE_URL = "https://api.openai.com/v1"
+OPENAI_API_KEY = ""
+OPENAI_MODEL = "gpt-5.2"
 ASSISTANT_REASONING_EFFORT = ""
 
 ASSISTANT_TTS_MODEL = "tts-1"
