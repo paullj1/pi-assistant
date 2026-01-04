@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 CONFIG_DIR="$XDG_CONFIG_HOME/pi-assistant"
 SERVICE_DIR="$XDG_CONFIG_HOME/systemd/user"
+SERVICE_PATH="$SERVICE_DIR/pi-assistant.service"
 
 mkdir -p "$CONFIG_DIR"
 mkdir -p "$SERVICE_DIR"
@@ -23,7 +24,22 @@ else
   python3 -m pip install "$ROOT_DIR"
 fi
 
-cp -f "$ROOT_DIR/pi-assistant.service" "$SERVICE_DIR/pi-assistant.service"
+cat > "$SERVICE_PATH" <<'EOF'
+[Unit]
+Description=Pi Assistant
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=pi-assistant
+Restart=on-failure
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
+EOF
 
 systemctl --user daemon-reload
 systemctl --user enable --now pi-assistant.service
