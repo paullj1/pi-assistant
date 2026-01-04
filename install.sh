@@ -113,7 +113,7 @@ else
   fi
 fi
 
-cat > "$SERVICE_PATH" <<'EOF'
+cat > "$SERVICE_PATH" <<EOF
 [Unit]
 Description=Pi Assistant
 After=network-online.target sound.target
