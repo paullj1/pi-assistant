@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "ddg-search": {
+      "command": "uvx",
+      "args": ["duckduckgo-mcp-server"]
+    },
+    "mcp-datetime": {
+      "command": "uvx",
+      "args": ["mcp-datetime"]
+    }
+  }
+}
