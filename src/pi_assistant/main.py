@@ -15,7 +15,9 @@ Key additions vs earlier version:
 """
 
 import argparse
+import array
 import json
+import math
 import os
 import queue
 import re
@@ -646,44 +648,48 @@ def _ensure_working_beep() -> str:
     if path_key in _CUE_PATHS:
         return _CUE_PATHS[path_key]
 
-    duration_s = max(0.02, WORKING_BEEP_MS / 1000.0)
-    t = np.linspace(0, duration_s, int(SAMPLE_RATE * duration_s), endpoint=False)
-
-    if WORKING_BEEP_STYLE == "sequence":
-        thirds = max(1, len(t) // 3)
-        wave_data = np.empty_like(t)
-        wave_data[:thirds] = np.sin(2 * np.pi * WORKING_BEEP_HZ * t[:thirds])
-        wave_data[thirds : 2 * thirds] = np.sin(
-            2 * np.pi * WORKING_BEEP_HZ2 * t[thirds : 2 * thirds]
-        )
-        wave_data[2 * thirds :] = np.sin(2 * np.pi * WORKING_BEEP_HZ3 * t[2 * thirds :])
-    elif WORKING_BEEP_STYLE == "swoop":
-        f0 = max(20.0, WORKING_BEEP_HZ * 0.8)
-        f1 = max(20.0, WORKING_BEEP_HZ2)
-        freqs = f0 + (f1 - f0) * (t / duration_s)
-        phase = 2 * np.pi * np.cumsum(freqs) / SAMPLE_RATE
-        wave_data = np.sin(phase)
-    elif WORKING_BEEP_STYLE == "chime":
-        split = max(1, len(t) // 2)
-        wave_data = np.empty_like(t)
-        wave_data[:split] = np.sin(2 * np.pi * WORKING_BEEP_HZ * t[:split])
-        wave_data[split:] = np.sin(2 * np.pi * WORKING_BEEP_HZ2 * t[split:])
-    else:
-        wave_data = np.sin(2 * np.pi * WORKING_BEEP_HZ * t)
-
-    fade = np.linspace(1.0, 0.0, num=wave_data.size, endpoint=True)
-    wave_data = (wave_data * fade * WORKING_BEEP_GAIN).astype(np.float32)
-    pcm16 = (wave_data * 32767.0).astype(np.int16)
+    data, sample_rate = _generate_waiting_tone_cycle()
 
     out_path = "/tmp/assistant_working_cue.wav"
     with wave.open(out_path, "wb") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
-        wf.setframerate(SAMPLE_RATE)
-        wf.writeframes(pcm16.tobytes())
+        wf.setframerate(sample_rate)
+        wf.writeframes(data.tobytes())
 
     _CUE_PATHS[path_key] = out_path
     return out_path
+
+
+def _generate_waiting_tone_cycle(
+    sample_rate: int = 44100,
+    freq: float = 220.0,
+    tone_seconds: float = 0.43,
+    echo_count: int = 6,
+    echo_delay: float = 0.26,
+    echo_decay: float = 0.85,
+    rest_seconds: float = 0.5,
+) -> tuple[array.array, int]:
+    total_seconds = tone_seconds + echo_delay * echo_count + rest_seconds
+    total_samples = int(total_seconds * sample_rate)
+    data = array.array("h", [0] * total_samples)
+
+    def add_tone(start_time: float, amplitude: float) -> None:
+        start_idx = int(start_time * sample_rate)
+        tone_samples = int(tone_seconds * sample_rate)
+        for i in range(tone_samples):
+            t = i / sample_rate
+            fade = max(0.0, 1.0 - (i / tone_samples))
+            sample = math.sin(2.0 * math.pi * freq * t) * amplitude * fade
+            idx = start_idx + i
+            if idx < total_samples:
+                data[idx] += int(sample * 32767)
+
+    add_tone(0.0, 0.35)
+    for n in range(1, echo_count + 1):
+        add_tone(n * echo_delay, 0.35 * (echo_decay**n))
+
+    return data, sample_rate
 
 
 def _play_cue(mode: str, tts_text: str, beep_key: str, hz: float, ms: int, gain: float):
@@ -744,7 +750,10 @@ def _start_working_cue_loop():
     stop_event = Event()
 
     def _loop():
-        pause_s = max(0.02, WORKING_BEEP_PAUSE_MS / 1000.0)
+        if WORKING_CUE == "beep":
+            pause_s = 0.0
+        else:
+            pause_s = max(0.02, WORKING_BEEP_PAUSE_MS / 1000.0)
         while not stop_event.is_set():
             _play_cue(
                 WORKING_CUE,
