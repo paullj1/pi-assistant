@@ -2,7 +2,7 @@
 Raspberry Pi voice assistant (wake word + barge-in)
 
 Pipeline:
-  Mic -> wake word -> record until silence (RMS VAD) -> (optional) noise gate -> STT (OpenAI-compatible /v1/audio/transcription)
+  Mic -> wake word -> record until silence (RMS VAD) -> (optional) noise gate -> STT (OpenAI-compatible /v1/audio/transcriptions)
       -> Chat (OpenAI-compatible /v1/chat/completions via your Caddy/OpenWebUI)
       -> TTS (OpenAI-compatible /v1/audio/speech via your Caddy/TTS)
       -> Speaker (aplay)
@@ -1440,10 +1440,10 @@ def _pcm16_to_wav_bytes(pcm16_bytes: bytes) -> bytes:
 
 def _stt_openai(pcm16_bytes: bytes) -> str:
     """
-    POST {API_BASE}/audio/transcription
+    POST {API_BASE}/audio/transcriptions
     Returns the transcript text.
     """
-    url = f"{API_BASE}/audio/transcription"
+    url = f"{API_BASE}/audio/transcriptions"
     wav_bytes = _pcm16_to_wav_bytes(pcm16_bytes)
     files = {"file": ("audio.wav", wav_bytes, "audio/wav")}
     data = {
