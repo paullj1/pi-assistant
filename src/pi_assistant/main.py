@@ -526,6 +526,93 @@ def openai_chat(messages, tools=None):
     return data["choices"][0]["message"]
 
 
+def openai_chat_stream(messages, tools=None, on_text_delta=None, on_tool_call=None):
+    """
+    POST {API_BASE}/chat/completions with stream=True.
+    Calls on_text_delta for each content delta.
+    Returns the assembled assistant message.
+    """
+    url = f"{API_BASE}/chat/completions"
+    payload = {
+        "model": CHAT_MODEL,
+        "messages": messages,
+        "temperature": 0.4,
+        "stream": True,
+    }
+    if REASONING_EFFORT:
+        payload["reasoning"] = {"effort": REASONING_EFFORT}
+    if tools:
+        payload["tools"] = tools
+    _debug(
+        f"chat stream request tools={len(payload.get('tools', []))} messages={len(messages)}"
+    )
+    _debug_payload(payload)
+    r = requests.post(
+        url, headers=_headers_json(), json=payload, stream=True, timeout=180
+    )
+    r.raise_for_status()
+
+    content_parts = []
+    tool_calls = {}
+    role = "assistant"
+    saw_tool_calls = False
+
+    for raw_line in r.iter_lines(decode_unicode=True):
+        if not raw_line:
+            continue
+        line = raw_line.strip()
+        if line.startswith("data:"):
+            data = line[5:].strip()
+        else:
+            continue
+        if data == "[DONE]":
+            break
+        try:
+            chunk = json.loads(data)
+        except Exception:
+            continue
+        choices = chunk.get("choices", [])
+        if not choices:
+            continue
+        delta = choices[0].get("delta", {}) or {}
+        if "role" in delta:
+            role = delta.get("role") or role
+        if "content" in delta:
+            text_delta = delta.get("content") or ""
+            if text_delta:
+                content_parts.append(text_delta)
+                if on_text_delta:
+                    on_text_delta(text_delta)
+        if "tool_calls" in delta:
+            if not saw_tool_calls and on_tool_call:
+                on_tool_call()
+            saw_tool_calls = True
+            for call in delta.get("tool_calls", []):
+                idx = call.get("index", 0)
+                entry = tool_calls.get(idx)
+                if entry is None:
+                    entry = {
+                        "id": call.get("id"),
+                        "type": call.get("type"),
+                        "function": {"name": "", "arguments": ""},
+                    }
+                    tool_calls[idx] = entry
+                if call.get("id"):
+                    entry["id"] = call.get("id")
+                if call.get("type"):
+                    entry["type"] = call.get("type")
+                fn = call.get("function") or {}
+                if fn.get("name"):
+                    entry["function"]["name"] = fn.get("name")
+                if fn.get("arguments"):
+                    entry["function"]["arguments"] += fn.get("arguments")
+
+    message = {"role": role, "content": "".join(content_parts)}
+    if tool_calls:
+        message["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls)]
+    return message
+
+
 # ----------------------------
 # OpenAI-compatible TTS
 # ----------------------------
@@ -616,6 +703,115 @@ def _split_tts_chunks(text: str, max_chars: int) -> list[str]:
         chunks.append(current)
 
     return chunks
+
+
+def _extract_complete_sentences(text: str) -> tuple[list[str], str]:
+    sentences = []
+    start = 0
+    for match in re.finditer(r"[.!?]+(?:\s+|$)", text):
+        end = match.end()
+        sentence = text[start:end].strip()
+        if sentence:
+            sentences.append(sentence)
+        start = end
+    return sentences, text[start:]
+
+
+class StreamingTTS:
+    def __init__(self, wake_event: Event, on_first_audio):
+        self._wake_event = wake_event
+        self._on_first_audio = on_first_audio
+        self._sentence_queue = queue.Queue()
+        self._audio_queue = queue.Queue()
+        self._buffer = ""
+        self._aborted = Event()
+        self._interrupted = Event()
+        self._disabled = False
+        self._started_audio = Event()
+        self._synth_thread = Thread(target=self._synth_loop, daemon=True)
+        self._play_thread = Thread(target=self._play_loop, daemon=True)
+
+    def start(self):
+        self._synth_thread.start()
+        self._play_thread.start()
+
+    def on_text_delta(self, delta: str):
+        if self._disabled or self._aborted.is_set():
+            return
+        self._buffer += delta
+        sentences, self._buffer = _extract_complete_sentences(self._buffer)
+        for sentence in sentences:
+            self._sentence_queue.put(sentence)
+
+    def on_tool_call(self):
+        self.disable()
+
+    def disable(self):
+        if self._disabled:
+            return
+        self._disabled = True
+        self._aborted.set()
+        self._sentence_queue.put(None)
+
+    def finish(self) -> bool:
+        if not self._disabled and not self._aborted.is_set():
+            tail = self._buffer.strip()
+            if tail:
+                self._sentence_queue.put(tail)
+        self._sentence_queue.put(None)
+        self._synth_thread.join()
+        self._play_thread.join()
+        return self._interrupted.is_set()
+
+    def used(self) -> bool:
+        return self._started_audio.is_set()
+
+    def _synth_loop(self):
+        while True:
+            item = self._sentence_queue.get()
+            if item is None:
+                break
+            if self._aborted.is_set():
+                break
+            try:
+                path = _synthesize_tts(item)
+            except Exception as e:
+                self._audio_queue.put(e)
+                break
+            self._audio_queue.put(path)
+        self._audio_queue.put(None)
+
+    def _play_loop(self):
+        first_audio = True
+        while True:
+            if self._aborted.is_set():
+                break
+            if self._wake_event.is_set():
+                self._wake_event.clear()
+                self._interrupted.set()
+                break
+            try:
+                item = self._audio_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if item is None:
+                break
+            if isinstance(item, Exception):
+                self._interrupted.set()
+                break
+            if first_audio:
+                self._started_audio.set()
+                if self._on_first_audio:
+                    self._on_first_audio()
+                first_audio = False
+            proc = _play_audio(item)
+            while proc.poll() is None:
+                if self._wake_event.is_set() or self._aborted.is_set():
+                    self._wake_event.clear()
+                    stop_playback(proc)
+                    self._interrupted.set()
+                    return
+                time.sleep(0.05)
 
 
 def stop_playback(proc: subprocess.Popen):
@@ -783,6 +979,35 @@ def _stop_working_cue_loop(stop_event, thread):
     stop_event.set()
     if thread is not None:
         thread.join(timeout=1.0)
+
+
+def chat_with_streaming_tts(messages, tools, wake_event: Event, audio_stream: AudioStream):
+    stop_cue_event, cue_thread = _start_working_cue_loop()
+    interrupt_stop_event = Event()
+    interrupt_listener = Thread(
+        target=wait_for_wake_word,
+        args=(wake_event, interrupt_stop_event, audio_stream),
+        daemon=True,
+    )
+    interrupt_listener.start()
+    stream_tts = StreamingTTS(
+        wake_event, lambda: _stop_working_cue_loop(stop_cue_event, cue_thread)
+    )
+    stream_tts.start()
+    try:
+        reply_msg = openai_chat_stream(
+            messages,
+            tools,
+            on_text_delta=stream_tts.on_text_delta,
+            on_tool_call=stream_tts.on_tool_call,
+        )
+    finally:
+        _stop_working_cue_loop(stop_cue_event, cue_thread)
+    interrupted = stream_tts.finish()
+    interrupt_stop_event.set()
+    interrupt_listener.join()
+    used_stream_tts = stream_tts.used()
+    return reply_msg, interrupted if used_stream_tts else False, used_stream_tts
 
 
 def _listen_for_user(audio_stream: AudioStream, play_cue: bool) -> str:
@@ -1277,9 +1502,10 @@ def main():
                 print(f"You: {text}")
                 history.append(Turn("user", text))
 
-                stop_cue_event, cue_thread = _start_working_cue_loop()
                 try:
-                    reply_msg = openai_chat(_serialize_messages(history), mcp_tools)
+                    reply_msg, interrupted, used_stream_tts = chat_with_streaming_tts(
+                        _serialize_messages(history), mcp_tools, wake_event, audio_stream
+                    )
                     while reply_msg.get("tool_calls"):
                         if not mcp_tools:
                             _debug("model requested tools but none are configured")
@@ -1287,6 +1513,8 @@ def main():
                                 "role": "assistant",
                                 "content": "Tools are unavailable.",
                             }
+                            used_stream_tts = False
+                            interrupted = False
                             break
                         history.append(reply_msg)
                         for call in reply_msg.get("tool_calls", []):
@@ -1307,7 +1535,12 @@ def main():
                                     "content": result,
                                 }
                             )
-                        reply_msg = openai_chat(_serialize_messages(history), mcp_tools)
+                        reply_msg, interrupted, used_stream_tts = chat_with_streaming_tts(
+                            _serialize_messages(history),
+                            mcp_tools,
+                            wake_event,
+                            audio_stream,
+                        )
                 except requests.RequestException as e:
                     print("LLM request failed:", e)
                     try:
@@ -1322,84 +1555,87 @@ def main():
                     except Exception:
                         pass
                     continue
-                finally:
-                    _stop_working_cue_loop(stop_cue_event, cue_thread)
 
                 reply = (reply_msg.get("content") or "").strip()
                 print(f"Assistant: {reply}\n")
                 history.append({"role": "assistant", "content": reply})
 
+                if interrupted:
+                    prompt_cue = True
+                    continue
+
                 if reply:
-                    chunks = _split_tts_chunks(reply, TTS_CHUNK_CHARS)
-                    if not chunks:
-                        chunks = [reply]
+                    if not used_stream_tts:
+                        chunks = _split_tts_chunks(reply, TTS_CHUNK_CHARS)
+                        if not chunks:
+                            chunks = [reply]
 
-                    stop_event = Event()
-                    interrupt_listener = Thread(
-                        target=wait_for_wake_word,
-                        args=(wake_event, stop_event, audio_stream),
-                        daemon=True,
-                    )
-                    interrupt_listener.start()
+                        stop_event = Event()
+                        interrupt_listener = Thread(
+                            target=wait_for_wake_word,
+                            args=(wake_event, stop_event, audio_stream),
+                            daemon=True,
+                        )
+                        interrupt_listener.start()
 
-                    interrupted = False
-                    audio_queue = queue.Queue()
-                    synth_done = Event()
+                        interrupted = False
+                        audio_queue = queue.Queue()
+                        synth_done = Event()
 
-                    def _prefetch():
-                        for chunk in chunks:
+                        def _prefetch():
+                            for chunk in chunks:
+                                try:
+                                    path = _synthesize_tts(chunk)
+                                except Exception as e:
+                                    audio_queue.put(e)
+                                    break
+                                audio_queue.put(path)
+                            synth_done.set()
+
+                        synth_thread = Thread(target=_prefetch, daemon=True)
+                        synth_thread.start()
+
+                        stop_cue_event, cue_thread = _start_working_cue_loop()
+                        first_audio = True
+
+                        while not synth_done.is_set() or not audio_queue.empty():
                             try:
-                                path = _synthesize_tts(chunk)
-                            except Exception as e:
-                                audio_queue.put(e)
-                                break
-                            audio_queue.put(path)
-                        synth_done.set()
+                                item = audio_queue.get(timeout=0.1)
+                            except queue.Empty:
+                                if wake_event.is_set():
+                                    wake_event.clear()
+                                    interrupted = True
+                                    break
+                                continue
 
-                    synth_thread = Thread(target=_prefetch, daemon=True)
-                    synth_thread.start()
+                            if first_audio:
+                                _stop_working_cue_loop(stop_cue_event, cue_thread)
+                                first_audio = False
 
-                    stop_cue_event, cue_thread = _start_working_cue_loop()
-                    first_audio = True
-
-                    while not synth_done.is_set() or not audio_queue.empty():
-                        try:
-                            item = audio_queue.get(timeout=0.1)
-                        except queue.Empty:
-                            if wake_event.is_set():
-                                wake_event.clear()
+                            if isinstance(item, Exception):
+                                print("TTS failed:", item)
                                 interrupted = True
                                 break
-                            continue
 
-                        if first_audio:
-                            _stop_working_cue_loop(stop_cue_event, cue_thread)
-                            first_audio = False
-
-                        if isinstance(item, Exception):
-                            print("TTS failed:", item)
-                            interrupted = True
-                            break
-
-                        proc = _play_audio(item)
-                        while proc.poll() is None:
-                            if wake_event.is_set():
-                                wake_event.clear()
-                                stop_playback(proc)
-                                interrupted = True
+                            proc = _play_audio(item)
+                            while proc.poll() is None:
+                                if wake_event.is_set():
+                                    wake_event.clear()
+                                    stop_playback(proc)
+                                    interrupted = True
+                                    break
+                                time.sleep(0.05)
+                            if interrupted:
                                 break
-                            time.sleep(0.05)
+
+                        _stop_working_cue_loop(stop_cue_event, cue_thread)
+
+                        stop_event.set()
+                        interrupt_listener.join()
+
                         if interrupted:
-                            break
-
-                    _stop_working_cue_loop(stop_cue_event, cue_thread)
-
-                    stop_event.set()
-                    interrupt_listener.join()
-
-                    if interrupted:
-                        prompt_cue = True
-                        continue
+                            prompt_cue = True
+                            continue
 
                 if _should_end_conversation(reply):
                     follow_text = _listen_for_user(audio_stream, play_cue=False)
