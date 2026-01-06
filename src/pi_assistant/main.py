@@ -29,10 +29,12 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from threading import Condition, Event, Lock, Thread
 from typing import Any
+from urllib.parse import urlencode
 
 import numpy as np
 import requests
 import sounddevice as sd
+import websocket
 
 # ----------------------------
 # Config (env overrides)
@@ -117,6 +119,8 @@ TTS_FORMAT = _as_str("ASSISTANT_TTS_FORMAT", "wav")
 TTS_CHUNK_CHARS = _as_int("ASSISTANT_TTS_CHUNK_CHARS", 220)
 MCP_CONFIG = _as_str("ASSISTANT_MCP_CONFIG", "").strip()
 STT_MODEL = _as_str("ASSISTANT_STT_MODEL", "Systran/faster-whisper-small")
+STT_STREAM = _as_bool("ASSISTANT_STT_STREAM", False)
+STT_STREAM_FINAL_TIMEOUT = _as_float("ASSISTANT_STT_STREAM_FINAL_TIMEOUT", 3.0)
 
 # Audio
 SAMPLE_RATE = _as_int("ASSISTANT_SAMPLE_RATE", 16000)
@@ -226,6 +230,21 @@ def _headers_auth():
     if API_KEY:
         h["Authorization"] = f"Bearer {API_KEY}"
     return h
+
+
+def _headers_ws():
+    headers = []
+    if API_KEY:
+        headers.append(f"Authorization: Bearer {API_KEY}")
+    return headers
+
+
+def _api_base_ws() -> str:
+    if API_BASE.startswith("https://"):
+        return "wss://" + API_BASE[len("https://") :]
+    if API_BASE.startswith("http://"):
+        return "ws://" + API_BASE[len("http://") :]
+    return API_BASE
 
 
 def _debug(msg: str):
@@ -1017,6 +1036,9 @@ def _listen_for_user(audio_stream: AudioStream, play_cue: bool) -> str:
         except Exception as e:
             _debug(f"wake cue failed: {e}")
 
+    if STT_STREAM:
+        return _listen_for_user_streaming(audio_stream)
+
     if WAKE_LISTEN_FULL_WINDOW:
         pcm = record_after_speech_start_from_stream(
             audio_stream,
@@ -1042,6 +1064,25 @@ def _listen_for_user(audio_stream: AudioStream, play_cue: bool) -> str:
 # ----------------------------
 # Audio record + VAD
 # ----------------------------
+def _process_audio_float(audio: np.ndarray) -> bytes:
+    if audio.ndim == 2 and audio.shape[1] > 1:
+        audio = np.mean(audio, axis=1, keepdims=True)
+
+    audio = audio.reshape(-1)
+
+    if MIC_SOFT_GAIN != 1.0:
+        audio = audio * MIC_SOFT_GAIN
+
+    if CLIP:
+        audio = np.clip(audio, -1.0, 1.0)
+
+    if NOISE_GATE and NOISE_GATE > 0.0:
+        audio[np.abs(audio) < NOISE_GATE] = 0.0
+
+    pcm16 = (audio * 32767.0).astype(np.int16)
+    return pcm16.tobytes()
+
+
 def record_until_silence(
     max_seconds=MAX_SECONDS,
     silence_seconds=SILENCE_SECONDS,
@@ -1086,25 +1127,7 @@ def record_until_silence(
 
     audio = np.concatenate(chunks, axis=0)
 
-    # Downmix if needed
-    if audio.ndim == 2 and audio.shape[1] > 1:
-        audio = np.mean(audio, axis=1, keepdims=True)
-
-    audio = audio.reshape(-1)
-
-    # --- gain + noise control ---
-    if MIC_SOFT_GAIN != 1.0:
-        audio = audio * MIC_SOFT_GAIN
-
-    if CLIP:
-        audio = np.clip(audio, -1.0, 1.0)
-
-    # Simple noise gate (kills hiss in quiet parts)
-    if NOISE_GATE and NOISE_GATE > 0.0:
-        audio[np.abs(audio) < NOISE_GATE] = 0.0
-
-    pcm16 = (audio * 32767.0).astype(np.int16)
-    return pcm16.tobytes()
+    return _process_audio_float(audio)
 
 
 def record_until_silence_from_stream(
@@ -1113,6 +1136,7 @@ def record_until_silence_from_stream(
     silence_seconds=SILENCE_SECONDS,
     threshold=RMS_THRESHOLD,
     drain=True,
+    on_chunk=None,
 ):
     chunks = []
     silence_run = 0.0
@@ -1130,6 +1154,8 @@ def record_until_silence_from_stream(
             continue
 
         chunks.append(chunk)
+        if on_chunk:
+            on_chunk(_process_audio_float(chunk))
         rms = float(np.sqrt(np.mean(chunk**2)))
         dt = len(chunk) / float(SAMPLE_RATE)
 
@@ -1145,23 +1171,7 @@ def record_until_silence_from_stream(
         return b""
 
     audio = np.concatenate(chunks, axis=0)
-
-    if audio.ndim == 2 and audio.shape[1] > 1:
-        audio = np.mean(audio, axis=1, keepdims=True)
-
-    audio = audio.reshape(-1)
-
-    if MIC_SOFT_GAIN != 1.0:
-        audio = audio * MIC_SOFT_GAIN
-
-    if CLIP:
-        audio = np.clip(audio, -1.0, 1.0)
-
-    if NOISE_GATE and NOISE_GATE > 0.0:
-        audio[np.abs(audio) < NOISE_GATE] = 0.0
-
-    pcm16 = (audio * 32767.0).astype(np.int16)
-    return pcm16.tobytes()
+    return _process_audio_float(audio)
 
 
 def record_after_speech_start_from_stream(
@@ -1171,6 +1181,7 @@ def record_after_speech_start_from_stream(
     silence_seconds: float,
     threshold: float,
     drain: bool = True,
+    on_chunk=None,
 ):
     if drain:
         audio_stream.drain()
@@ -1203,6 +1214,8 @@ def record_after_speech_start_from_stream(
                 continue
 
         chunks.append(chunk)
+        if on_chunk:
+            on_chunk(_process_audio_float(chunk))
         silence_run = silence_run + dt if rms < threshold else 0.0
 
         elapsed = time.time() - start
@@ -1215,28 +1228,206 @@ def record_after_speech_start_from_stream(
         return b""
 
     audio = np.concatenate(chunks, axis=0)
-
-    if audio.ndim == 2 and audio.shape[1] > 1:
-        audio = np.mean(audio, axis=1, keepdims=True)
-
-    audio = audio.reshape(-1)
-
-    if MIC_SOFT_GAIN != 1.0:
-        audio = audio * MIC_SOFT_GAIN
-
-    if CLIP:
-        audio = np.clip(audio, -1.0, 1.0)
-
-    if NOISE_GATE and NOISE_GATE > 0.0:
-        audio[np.abs(audio) < NOISE_GATE] = 0.0
-
-    pcm16 = (audio * 32767.0).astype(np.int16)
-    return pcm16.tobytes()
+    return _process_audio_float(audio)
 
 
 # ----------------------------
 # OpenAI-compatible STT
 # ----------------------------
+def _stt_ws_url() -> str:
+    base = _api_base_ws().rstrip("/")
+    params = {
+        "model": STT_MODEL,
+        "response_format": "json",
+    }
+    return f"{base}/audio/transcriptions?{urlencode(params)}"
+
+
+def _update_transcript(assembled: str, new_text: str, is_delta: bool) -> str:
+    if not new_text:
+        return assembled
+    if is_delta:
+        return assembled + new_text
+    if new_text.startswith(assembled):
+        return new_text
+    if assembled.startswith(new_text):
+        return assembled
+    return assembled + new_text
+
+
+def _apply_transcript_message(
+    assembled: str, payload: dict, last_full: str
+) -> tuple[str, str]:
+    if not payload:
+        return assembled, last_full
+    choices = payload.get("choices") or []
+    if choices:
+        delta = choices[0].get("delta", {}) or {}
+        content = delta.get("content") or ""
+        if content:
+            assembled = _update_transcript(assembled, content, True)
+        text = choices[0].get("text") or ""
+        if text:
+            assembled = _update_transcript(assembled, text, True)
+        return assembled, last_full
+
+    if isinstance(payload.get("segment"), dict):
+        text = payload["segment"].get("text") or ""
+        if text:
+            assembled = _update_transcript(assembled, text, True)
+        return assembled, last_full
+
+    segments = payload.get("segments")
+    if isinstance(segments, list) and segments:
+        joined = " ".join(seg.get("text", "").strip() for seg in segments).strip()
+        if joined:
+            assembled = _update_transcript(assembled, joined, False)
+            last_full = joined
+        return assembled, last_full
+
+    text = (
+        payload.get("text")
+        or payload.get("transcript")
+        or payload.get("output")
+        or ""
+    )
+    if text:
+        is_delta = bool(payload.get("delta"))
+        if not is_delta and text == last_full:
+            return assembled, last_full
+        assembled = _update_transcript(assembled, text, is_delta)
+        last_full = text if not is_delta else last_full
+    return assembled, last_full
+
+
+def _stt_openai_streaming_from_stream(
+    audio_stream: AudioStream,
+    full_window: bool,
+    max_wait_seconds: float,
+    max_seconds: float,
+    silence_seconds: float,
+    threshold: float,
+) -> str:
+    if SAMPLE_RATE != 16000:
+        _debug("streaming stt expects 16k sample rate")
+
+    url = _stt_ws_url()
+    ws = websocket.create_connection(url, header=_headers_ws())
+    ws.settimeout(0.5)
+
+    transcript = ""
+    last_full = ""
+    recv_error = None
+    recv_done = Event()
+    sending_done = Event()
+    last_message_time = time.time()
+
+    def _recv_loop():
+        nonlocal transcript, last_full, recv_error, last_message_time
+        while True:
+            try:
+                msg = ws.recv()
+            except websocket.WebSocketTimeoutException:
+                if sending_done.is_set():
+                    if time.time() - last_message_time >= STT_STREAM_FINAL_TIMEOUT:
+                        break
+                continue
+            except Exception as e:
+                recv_error = e
+                break
+            if msg is None:
+                break
+            last_message_time = time.time()
+            if isinstance(msg, (bytes, bytearray)):
+                continue
+            try:
+                payload = json.loads(msg)
+            except Exception:
+                continue
+            transcript, last_full = _apply_transcript_message(
+                transcript, payload, last_full
+            )
+        recv_done.set()
+
+    recv_thread = Thread(target=_recv_loop, daemon=True)
+    recv_thread.start()
+
+    def _send_chunk(pcm: bytes):
+        if not pcm:
+            return
+        try:
+            ws.send(pcm, opcode=websocket.ABNF.OPCODE_BINARY)
+        except Exception:
+            pass
+
+    try:
+        if full_window:
+            pcm = record_after_speech_start_from_stream(
+                audio_stream,
+                max_wait_seconds=max_wait_seconds,
+                max_seconds=max_seconds,
+                silence_seconds=silence_seconds,
+                threshold=threshold,
+                drain=False,
+                on_chunk=_send_chunk,
+            )
+        else:
+            pcm = record_until_silence_from_stream(
+                audio_stream,
+                max_seconds=max_seconds,
+                silence_seconds=silence_seconds,
+                threshold=threshold,
+                drain=False,
+                on_chunk=_send_chunk,
+            )
+        if not pcm:
+            sending_done.set()
+            recv_thread.join(timeout=1.0)
+            ws.close()
+            return ""
+    finally:
+        sending_done.set()
+
+    recv_thread.join(timeout=STT_STREAM_FINAL_TIMEOUT + 1.0)
+    ws.close()
+    if recv_error:
+        _debug(f"stt stream recv error: {recv_error}")
+    return transcript.strip()
+
+
+def _listen_for_user_streaming(audio_stream: AudioStream) -> str:
+    try:
+        return _stt_openai_streaming_from_stream(
+            audio_stream,
+            WAKE_LISTEN_FULL_WINDOW,
+            WAKE_LISTEN_SECONDS,
+            WAKE_LISTEN_SECONDS,
+            SILENCE_SECONDS,
+            RMS_THRESHOLD,
+        )
+    except Exception as e:
+        _debug(f"stt streaming failed, falling back: {e}")
+    if WAKE_LISTEN_FULL_WINDOW:
+        pcm = record_after_speech_start_from_stream(
+            audio_stream,
+            max_wait_seconds=WAKE_LISTEN_SECONDS,
+            max_seconds=WAKE_LISTEN_SECONDS,
+            silence_seconds=SILENCE_SECONDS,
+            threshold=RMS_THRESHOLD,
+            drain=False,
+        )
+    else:
+        pcm = record_until_silence_from_stream(
+            audio_stream,
+            max_seconds=WAKE_LISTEN_SECONDS,
+            silence_seconds=SILENCE_SECONDS,
+            drain=False,
+        )
+    if not pcm:
+        return ""
+    return stt_whisper(pcm)
+
+
 def _pcm16_to_wav_bytes(pcm16_bytes: bytes) -> bytes:
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
@@ -1434,6 +1625,7 @@ def main():
     print(f"TTS:           model={TTS_MODEL} voice={TTS_VOICE} format={TTS_FORMAT}")
     print(f"Playback:      ALSA={ALSA_PLAYBACK}")
     print(f"STT:           model={STT_MODEL}")
+    print(f"STT streaming: {STT_STREAM}")
     print(f"Wake word:     {', '.join(WAKE_PHRASES)}")
     print(f"Wake cue:      {WAKE_CUE}")
     print(f"Working cue:   {WORKING_CUE}")

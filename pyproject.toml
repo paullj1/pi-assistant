@@ -16,6 +16,7 @@ dependencies = [
   "numpy",
   "requests",
   "sounddevice",
+  "websocket-client",
   "tomli; python_version < '3.11'",
 ]
 
