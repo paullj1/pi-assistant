@@ -2,7 +2,7 @@
 Raspberry Pi voice assistant (wake word + barge-in)
 
 Pipeline:
-  Mic -> wake word -> record until silence (RMS VAD) -> (optional) noise gate -> STT (whisper)
+  Mic -> wake word -> record until silence (RMS VAD) -> (optional) noise gate -> STT (OpenAI-compatible /v1/audio/transcription)
       -> Chat (OpenAI-compatible /v1/chat/completions via your Caddy/OpenWebUI)
       -> TTS (OpenAI-compatible /v1/audio/speech via your Caddy/TTS)
       -> Speaker (aplay)
@@ -17,6 +17,7 @@ Key additions vs earlier version:
 import argparse
 import array
 import json
+import io
 import math
 import os
 import queue
@@ -32,7 +33,6 @@ from typing import Any
 import numpy as np
 import requests
 import sounddevice as sd
-from faster_whisper import WhisperModel
 
 # ----------------------------
 # Config (env overrides)
@@ -116,6 +116,7 @@ TTS_VOICE = _as_str("ASSISTANT_TTS_VOICE", "alloy")
 TTS_FORMAT = _as_str("ASSISTANT_TTS_FORMAT", "wav")
 TTS_CHUNK_CHARS = _as_int("ASSISTANT_TTS_CHUNK_CHARS", 220)
 MCP_CONFIG = _as_str("ASSISTANT_MCP_CONFIG", "").strip()
+STT_MODEL = _as_str("ASSISTANT_STT_MODEL", "Systran/faster-whisper-small")
 
 # Audio
 SAMPLE_RATE = _as_int("ASSISTANT_SAMPLE_RATE", 16000)
@@ -183,7 +184,7 @@ END_USER_RESPONSES = {
 # Debug logging
 DEBUG = _as_bool("ASSISTANT_DEBUG", False)
 
-# Wake word (Whisper)
+# Wake word (STT)
 WAKE_WORD = _as_str("ASSISTANT_WAKE_WORD", "atlas").strip().lower()
 WAKE_PHRASES_ENV = _as_str("ASSISTANT_WAKE_PHRASES", "").strip()
 WAKE_PHRASES = [p.strip().lower() for p in WAKE_PHRASES_ENV.split(",") if p.strip()]
@@ -194,7 +195,6 @@ WAKE_RMS_THRESHOLD = _as_float("ASSISTANT_WAKE_RMS_THRESHOLD", 0.0005)
 WAKE_FUZZY_THRESHOLD = _as_float("ASSISTANT_WAKE_FUZZY_THRESHOLD", 0.6)
 WAKE_FULL_FUZZY_THRESHOLD = _as_float("ASSISTANT_WAKE_FULL_FUZZY_THRESHOLD", 0.75)
 WAKE_MIN_TOKEN_LEN = _as_int("ASSISTANT_WAKE_MIN_TOKEN_LEN", 3)
-WAKE_WHISPER_MODEL = _as_str("ASSISTANT_WAKE_WHISPER_MODEL", "tiny.en")
 WAKE_MIN_RMS_FOR_STT = _as_float("ASSISTANT_WAKE_MIN_RMS_FOR_STT", 0.0010)
 
 
@@ -216,6 +216,13 @@ def _serialize_messages(history):
 
 def _headers_json():
     h = {"Content-Type": "application/json"}
+    if API_KEY:
+        h["Authorization"] = f"Bearer {API_KEY}"
+    return h
+
+
+def _headers_auth():
+    h = {}
     if API_KEY:
         h["Authorization"] = f"Bearer {API_KEY}"
     return h
@@ -1003,54 +1010,56 @@ def record_after_speech_start_from_stream(
 
 
 # ----------------------------
-# Offline STT via Whisper
+# OpenAI-compatible STT
 # ----------------------------
-_WHISPER = None
+def _pcm16_to_wav_bytes(pcm16_bytes: bytes) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(pcm16_bytes)
+    return buf.getvalue()
+
+
+def _stt_openai(pcm16_bytes: bytes) -> str:
+    """
+    POST {API_BASE}/audio/transcription
+    Returns the transcript text.
+    """
+    url = f"{API_BASE}/audio/transcription"
+    wav_bytes = _pcm16_to_wav_bytes(pcm16_bytes)
+    files = {"file": ("audio.wav", wav_bytes, "audio/wav")}
+    data = {
+        "model": STT_MODEL,
+        "response_format": "json",
+    }
+    r = requests.post(
+        url,
+        headers=_headers_auth(),
+        data=data,
+        files=files,
+        timeout=180,
+    )
+    r.raise_for_status()
+    try:
+        payload = r.json()
+        return (
+            payload.get("text")
+            or payload.get("transcript")
+            or payload.get("output")
+            or ""
+        ).strip()
+    except ValueError:
+        return r.text.strip()
 
 
 def stt_whisper(pcm16_bytes: bytes) -> str:
-    global _WHISPER
-    if _WHISPER is None:
-        _WHISPER = WhisperModel(
-            "tiny.en",  # try tiny.en first if you want
-            device="cpu",
-            compute_type="int8",
-        )
-
-    audio = np.frombuffer(pcm16_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-
-    segments, _ = _WHISPER.transcribe(
-        audio,
-        language="en",
-        vad_filter=True,  # important
-    )
-
-    return " ".join(seg.text.strip() for seg in segments).strip()
-
-
-_WHISPER_WAKE = None
+    return _stt_openai(pcm16_bytes)
 
 
 def stt_whisper_wake(pcm16_bytes: bytes) -> str:
-    global _WHISPER_WAKE
-    if _WHISPER_WAKE is None:
-        _debug(f"loading wake whisper model: {WAKE_WHISPER_MODEL}")
-        _WHISPER_WAKE = WhisperModel(
-            WAKE_WHISPER_MODEL,
-            device="cpu",
-            compute_type="int8",
-        )
-
-    audio = np.frombuffer(pcm16_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-
-    segments, _ = _WHISPER_WAKE.transcribe(
-        audio,
-        language="en",
-        vad_filter=True,
-        beam_size=1,
-    )
-
-    return " ".join(seg.text.strip() for seg in segments).strip()
+    return _stt_openai(pcm16_bytes)
 
 
 def print_audio_devices():
