@@ -14,21 +14,8 @@ fi
 mkdir -p "$CONFIG_DIR"
 mkdir -p "$SERVICE_DIR"
 
-if [[ ! -f "$CONFIG_DIR/mcp.json" ]]; then
-  cat > "$CONFIG_DIR/mcp.json" <<'EOF'
-{
-  "mcpServers": {
-    "ddg-search": {
-      "command": "uvx",
-      "args": ["duckduckgo-mcp-server"]
-    }
-  }
-}
-EOF
-fi
-
-if [[ ! -f "$CONFIG_DIR/config.toml" ]]; then
-  cat > "$CONFIG_DIR/config.toml" <<'EOF'
+DEFAULT_CONFIG_CONTENT=$(
+  cat <<'EOF'
 [assistant]
 OPENAI_BASE_URL = "https://api.openai.com/v1"
 OPENAI_API_KEY = ""
@@ -39,6 +26,7 @@ ASSISTANT_TTS_MODEL = "tts-1"
 ASSISTANT_TTS_VOICE = "alloy"
 ASSISTANT_TTS_FORMAT = "wav"
 ASSISTANT_TTS_CHUNK_CHARS = 220
+ASSISTANT_STT_MODEL = "Systran/faster-whisper-small"
 
 ASSISTANT_SAMPLE_RATE = 16000
 ASSISTANT_CHANNELS = 1
@@ -88,12 +76,109 @@ ASSISTANT_WAKE_RMS_THRESHOLD = 0.0005
 ASSISTANT_WAKE_FUZZY_THRESHOLD = 0.6
 ASSISTANT_WAKE_FULL_FUZZY_THRESHOLD = 0.75
 ASSISTANT_WAKE_MIN_TOKEN_LEN = 3
-ASSISTANT_WAKE_WHISPER_MODEL = "tiny.en"
 ASSISTANT_WAKE_MIN_RMS_FOR_STT = 0.001
 
 ASSISTANT_MCP_CONFIG = ""
 ASSISTANT_LIST_DEVICES = false
 EOF
+)
+
+if [[ ! -f "$CONFIG_DIR/mcp.json" ]]; then
+  cat > "$CONFIG_DIR/mcp.json" <<'EOF'
+{
+  "mcpServers": {
+    "ddg-search": {
+      "command": "uvx",
+      "args": ["duckduckgo-mcp-server"]
+    },
+    "mcp-datetime": {
+      "command": "uvx",
+      "args": ["mcp-datetime"]
+    }
+  }
+}
+EOF
+fi
+
+if [[ ! -f "$CONFIG_DIR/config.toml" ]]; then
+  printf "%s\n" "$DEFAULT_CONFIG_CONTENT" > "$CONFIG_DIR/config.toml"
+else
+  PI_ASSISTANT_DEFAULT_CONFIG="$DEFAULT_CONFIG_CONTENT" python3 - "$CONFIG_DIR/config.toml" <<'PY'
+import os
+import sys
+import tomllib
+
+path = sys.argv[1]
+defaults_raw = os.environ.get("PI_ASSISTANT_DEFAULT_CONFIG", "")
+defaults = tomllib.loads(defaults_raw) if defaults_raw else {}
+
+with open(path, "rb") as f:
+    existing = tomllib.load(f)
+
+
+def _serialize_value(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    if isinstance(value, str):
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    if isinstance(value, list):
+        return "[" + ", ".join(_serialize_value(item) for item in value) + "]"
+    raise TypeError(f"Unsupported value type: {type(value)}")
+
+
+def _write_section(lines, section_name, section_data, ordered_keys=None):
+    lines.append(f"[{section_name}]")
+    keys = ordered_keys or list(section_data.keys())
+    for key in keys:
+        if key not in section_data:
+            continue
+        lines.append(f"{key} = {_serialize_value(section_data[key])}")
+    lines.append("")
+
+
+merged = dict(existing)
+
+defaults_assistant = defaults.get("assistant", {})
+existing_assistant = existing.get("assistant", {})
+assistant_keys = list(defaults_assistant.keys())
+
+merged_assistant = {}
+for key in assistant_keys:
+    if key in existing_assistant:
+        merged_assistant[key] = existing_assistant[key]
+    else:
+        merged_assistant[key] = defaults_assistant[key]
+
+if defaults_assistant:
+    merged["assistant"] = merged_assistant
+
+for section, value in defaults.items():
+    if section == "assistant":
+        continue
+    if section not in merged:
+        merged[section] = value
+
+lines = []
+if "assistant" in merged:
+    _write_section(lines, "assistant", merged["assistant"], assistant_keys)
+
+for section, value in merged.items():
+    if section == "assistant":
+        continue
+    if isinstance(value, dict):
+        _write_section(lines, section, value)
+    else:
+        lines.append(f"{section} = {_serialize_value(value)}")
+
+content = "\n".join(lines).rstrip() + "\n"
+with open(path, "w", encoding="utf-8") as f:
+    f.write(content)
+PY
 fi
 
 if command -v uv >/dev/null 2>&1; then
