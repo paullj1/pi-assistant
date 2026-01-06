@@ -192,7 +192,7 @@ DEBUG = _as_bool("ASSISTANT_DEBUG", False)
 WAKE_WORD = _as_str("ASSISTANT_WAKE_WORD", "atlas").strip().lower()
 WAKE_PHRASES_ENV = _as_str("ASSISTANT_WAKE_PHRASES", "").strip()
 WAKE_PHRASES = [p.strip().lower() for p in WAKE_PHRASES_ENV.split(",") if p.strip()]
-WAKE_PHRASES = WAKE_PHRASES or [WAKE_WORD]
+WAKE_PHRASES = WAKE_PHRASES or ([WAKE_WORD] if WAKE_WORD else [])
 WAKE_MAX_SECONDS = _as_float("ASSISTANT_WAKE_MAX_SECONDS", 1.97)
 WAKE_SILENCE_SECONDS = _as_float("ASSISTANT_WAKE_SILENCE_SECONDS", 0.6)
 WAKE_RMS_THRESHOLD = _as_float("ASSISTANT_WAKE_RMS_THRESHOLD", 0.0005)
@@ -1498,6 +1498,8 @@ def _normalize_text(text: str) -> str:
 
 
 def _contains_wake_word(text: str) -> bool:
+    if not WAKE_PHRASES:
+        return False
     normalized = _normalize_text(text)
     for phrase in WAKE_PHRASES:
         phrase_norm = _normalize_text(phrase)
