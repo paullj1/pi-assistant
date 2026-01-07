@@ -1274,15 +1274,21 @@ def _apply_transcript_message(
         delta = choices[0].get("delta", {}) or {}
         content = delta.get("content") or ""
         if content:
+            if DEBUG:
+                _debug(f"stt chunk: {content!r}")
             assembled = _update_transcript(assembled, content, True)
         text = choices[0].get("text") or ""
         if text:
+            if DEBUG:
+                _debug(f"stt chunk: {text!r}")
             assembled = _update_transcript(assembled, text, True)
         return assembled, last_full
 
     if isinstance(payload.get("segment"), dict):
         text = payload["segment"].get("text") or ""
         if text:
+            if DEBUG:
+                _debug(f"stt chunk: {text!r}")
             assembled = _update_transcript(assembled, text, True)
         return assembled, last_full
 
@@ -1290,6 +1296,8 @@ def _apply_transcript_message(
     if isinstance(segments, list) and segments:
         joined = " ".join(seg.get("text", "").strip() for seg in segments).strip()
         if joined:
+            if DEBUG:
+                _debug(f"stt chunk: {joined!r}")
             assembled = _update_transcript(assembled, joined, False)
             last_full = joined
         return assembled, last_full
@@ -1302,6 +1310,8 @@ def _apply_transcript_message(
     )
     if text:
         is_delta = bool(payload.get("delta"))
+        if DEBUG:
+            _debug(f"stt chunk: {text!r}")
         if not is_delta and text == last_full:
             return assembled, last_full
         assembled = _update_transcript(assembled, text, is_delta)
