@@ -30,6 +30,7 @@ from difflib import SequenceMatcher
 from threading import Condition, Event, Lock, Thread
 from typing import Any
 from urllib.parse import urlencode
+from collections import deque
 
 import numpy as np
 import requests
@@ -121,6 +122,7 @@ MCP_CONFIG = _as_str("ASSISTANT_MCP_CONFIG", "").strip()
 STT_MODEL = _as_str("ASSISTANT_STT_MODEL", "Systran/faster-whisper-small")
 STT_STREAM = _as_bool("ASSISTANT_STT_STREAM", False)
 STT_STREAM_FINAL_TIMEOUT = _as_float("ASSISTANT_STT_STREAM_FINAL_TIMEOUT", 3.0)
+STT_STREAM_PRE_ROLL = _as_float("ASSISTANT_STT_STREAM_PRE_ROLL", 1.5)
 
 # Audio
 SAMPLE_RATE = _as_int("ASSISTANT_SAMPLE_RATE", 16000)
@@ -1003,12 +1005,14 @@ def _stop_working_cue_loop(stop_event, thread):
 def chat_with_streaming_tts(messages, tools, wake_event: Event, audio_stream: AudioStream):
     stop_cue_event, cue_thread = _start_working_cue_loop()
     interrupt_stop_event = Event()
-    interrupt_listener = Thread(
-        target=wait_for_wake_word,
-        args=(wake_event, interrupt_stop_event, audio_stream),
-        daemon=True,
-    )
-    interrupt_listener.start()
+    interrupt_listener = None
+    if not STT_STREAM:
+        interrupt_listener = Thread(
+            target=wait_for_wake_word,
+            args=(wake_event, interrupt_stop_event, audio_stream),
+            daemon=True,
+        )
+        interrupt_listener.start()
     stream_tts = StreamingTTS(
         wake_event, lambda: _stop_working_cue_loop(stop_cue_event, cue_thread)
     )
@@ -1024,12 +1028,15 @@ def chat_with_streaming_tts(messages, tools, wake_event: Event, audio_stream: Au
         _stop_working_cue_loop(stop_cue_event, cue_thread)
     interrupted = stream_tts.finish()
     interrupt_stop_event.set()
-    interrupt_listener.join()
+    if interrupt_listener is not None:
+        interrupt_listener.join()
     used_stream_tts = stream_tts.used()
     return reply_msg, interrupted if used_stream_tts else False, used_stream_tts
 
 
-def _listen_for_user(audio_stream: AudioStream, play_cue: bool) -> str:
+def _listen_for_user(
+    audio_stream: AudioStream, play_cue: bool, pre_roll: bytes = b""
+) -> str:
     if play_cue:
         try:
             play_wake_cue()
@@ -1037,7 +1044,7 @@ def _listen_for_user(audio_stream: AudioStream, play_cue: bool) -> str:
             _debug(f"wake cue failed: {e}")
 
     if STT_STREAM:
-        return _listen_for_user_streaming(audio_stream)
+        return _listen_for_user_streaming(audio_stream, pre_roll)
 
     if WAKE_LISTEN_FULL_WINDOW:
         pcm = record_after_speech_start_from_stream(
@@ -1058,6 +1065,8 @@ def _listen_for_user(audio_stream: AudioStream, play_cue: bool) -> str:
     if not pcm:
         return ""
 
+    if pre_roll:
+        pcm = pre_roll + pcm
     return stt_whisper(pcm)
 
 
@@ -1307,6 +1316,7 @@ def _stt_openai_streaming_from_stream(
     max_seconds: float,
     silence_seconds: float,
     threshold: float,
+    pre_roll: bytes = b"",
 ) -> tuple[str, bytes]:
     if SAMPLE_RATE != 16000:
         _debug("streaming stt expects 16k sample rate")
@@ -1362,6 +1372,8 @@ def _stt_openai_streaming_from_stream(
             pass
 
     try:
+        if pre_roll:
+            _send_chunk(pre_roll)
         if full_window:
             pcm = record_after_speech_start_from_stream(
                 audio_stream,
@@ -1397,10 +1409,123 @@ def _stt_openai_streaming_from_stream(
     ws.close()
     if recv_error:
         _debug(f"stt stream recv error: {recv_error}")
+    if pre_roll:
+        pcm = pre_roll + pcm
     return transcript.strip(), pcm
 
 
-def _listen_for_user_streaming(audio_stream: AudioStream) -> str:
+class LiveWakeStreamer:
+    def __init__(self, audio_stream: AudioStream):
+        self._audio_stream = audio_stream
+        self._stop_event = Event()
+        self._thread = None
+        self._recv_thread = None
+        self._wake_event = None
+        self._pre_roll = deque()
+        self._pre_roll_samples = 0
+        self._pre_roll_limit = max(0.0, STT_STREAM_PRE_ROLL)
+        self._transcript = ""
+        self._lock = Lock()
+
+    def start(self, wake_event: Event):
+        self._wake_event = wake_event
+        self._stop_event.clear()
+        self._thread = Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        if self._recv_thread is not None:
+            self._recv_thread.join(timeout=1.0)
+
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def get_pre_roll(self) -> bytes:
+        with self._lock:
+            data = b"".join(self._pre_roll)
+        return data
+
+    def _append_pre_roll(self, pcm: bytes):
+        if self._pre_roll_limit <= 0:
+            return
+        samples = len(pcm) // 2
+        with self._lock:
+            self._pre_roll.append(pcm)
+            self._pre_roll_samples += samples
+            max_samples = int(self._pre_roll_limit * SAMPLE_RATE)
+            while self._pre_roll_samples > max_samples and self._pre_roll:
+                popped = self._pre_roll.popleft()
+                self._pre_roll_samples -= len(popped) // 2
+
+    def _apply_live_transcript(self, payload: dict) -> bool:
+        with self._lock:
+            self._transcript, _ = _apply_transcript_message(
+                self._transcript, payload, ""
+            )
+            if len(self._transcript) > 400:
+                self._transcript = self._transcript[-400:]
+            text = self._transcript
+        return _contains_wake_word(text)
+
+    def _run(self):
+        url = _stt_ws_url()
+        try:
+            ws = websocket.create_connection(url, header=_headers_ws())
+        except Exception as e:
+            _debug(f"wake ws connect failed: {e}")
+            return
+        ws.settimeout(0.5)
+
+        def _recv_loop():
+            while not self._stop_event.is_set():
+                try:
+                    msg = ws.recv()
+                except websocket.WebSocketTimeoutException:
+                    continue
+                except Exception:
+                    break
+                if msg is None or isinstance(msg, (bytes, bytearray)):
+                    continue
+                try:
+                    payload = json.loads(msg)
+                except Exception:
+                    continue
+                if self._apply_live_transcript(payload):
+                    if self._wake_event:
+                        self._wake_event.set()
+                    self._stop_event.set()
+                    break
+
+        self._recv_thread = Thread(target=_recv_loop, daemon=True)
+        self._recv_thread.start()
+
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    chunk = self._audio_stream.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                pcm = _process_audio_float(chunk)
+                self._append_pre_roll(pcm)
+                try:
+                    ws.send(pcm, opcode=websocket.ABNF.OPCODE_BINARY)
+                except Exception:
+                    break
+        finally:
+            try:
+                ws.send(b"", opcode=websocket.ABNF.OPCODE_BINARY)
+            except Exception:
+                pass
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+
+def _listen_for_user_streaming(audio_stream: AudioStream, pre_roll: bytes) -> str:
     try:
         transcript, pcm = _stt_openai_streaming_from_stream(
             audio_stream,
@@ -1409,6 +1534,7 @@ def _listen_for_user_streaming(audio_stream: AudioStream) -> str:
             WAKE_LISTEN_SECONDS,
             SILENCE_SECONDS,
             RMS_THRESHOLD,
+            pre_roll=pre_roll,
         )
         if transcript:
             return transcript
@@ -1566,34 +1692,21 @@ def wait_for_wake_word(
             f"(max={WAKE_MAX_SECONDS}s silence={WAKE_SILENCE_SECONDS}s "
             f"rms<{WAKE_RMS_THRESHOLD})"
         )
-        if STT_STREAM:
-            text, pcm = _stt_openai_streaming_from_stream(
-                audio_stream,
-                False,
-                WAKE_MAX_SECONDS,
-                WAKE_MAX_SECONDS,
-                WAKE_SILENCE_SECONDS,
-                WAKE_RMS_THRESHOLD,
-            )
-            if not pcm:
-                _debug("wake chunk empty")
-                continue
-        else:
-            pcm = record_until_silence_from_stream(
-                audio_stream,
-                max_seconds=WAKE_MAX_SECONDS,
-                silence_seconds=WAKE_SILENCE_SECONDS,
-                threshold=WAKE_RMS_THRESHOLD,
-            )
-            if not pcm:
-                _debug("wake chunk empty")
-                continue
+        pcm = record_until_silence_from_stream(
+            audio_stream,
+            max_seconds=WAKE_MAX_SECONDS,
+            silence_seconds=WAKE_SILENCE_SECONDS,
+            threshold=WAKE_RMS_THRESHOLD,
+        )
+        if not pcm:
+            _debug("wake chunk empty")
+            continue
 
-            audio_stream.pause()
-            try:
-                text = stt_whisper_wake(pcm)
-            finally:
-                audio_stream.resume()
+        audio_stream.pause()
+        try:
+            text = stt_whisper_wake(pcm)
+        finally:
+            audio_stream.resume()
 
         audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
         rms = float(np.sqrt(np.mean(audio**2))) if audio.size else 0.0
@@ -1651,6 +1764,8 @@ def main():
     print(f"Playback:      ALSA={ALSA_PLAYBACK}")
     print(f"STT:           model={STT_MODEL}")
     print(f"STT streaming: {STT_STREAM}")
+    if STT_STREAM:
+        print(f"STT pre-roll:  {STT_STREAM_PRE_ROLL:.1f}s")
     print(f"Wake word:     {', '.join(WAKE_PHRASES)}")
     print(f"Wake cue:      {WAKE_CUE}")
     print(f"Working cue:   {WORKING_CUE}")
@@ -1677,6 +1792,8 @@ def main():
 
     wake_event = Event()
     audio_stream = AudioStream()
+    wake_streamer = LiveWakeStreamer(audio_stream) if STT_STREAM else None
+    wake_pre_roll = b""
 
     try:
         audio_stream.start()
@@ -1684,16 +1801,26 @@ def main():
 
         while True:
             if not pending_wake:
-                stop_event = Event()
-                listener = Thread(
-                    target=wait_for_wake_word,
-                    args=(wake_event, stop_event, audio_stream),
-                    daemon=True,
-                )
-                listener.start()
-                wake_event.wait()
-                stop_event.set()
-                listener.join()
+                if STT_STREAM:
+                    wake_event.clear()
+                    wake_pre_roll = b""
+                    if wake_streamer is not None:
+                        wake_streamer.start(wake_event)
+                    wake_event.wait()
+                    if wake_streamer is not None:
+                        wake_streamer.stop()
+                        wake_pre_roll = wake_streamer.get_pre_roll()
+                else:
+                    stop_event = Event()
+                    listener = Thread(
+                        target=wait_for_wake_word,
+                        args=(wake_event, stop_event, audio_stream),
+                        daemon=True,
+                    )
+                    listener.start()
+                    wake_event.wait()
+                    stop_event.set()
+                    listener.join()
             wake_event.clear()
             pending_wake = False
 
@@ -1701,7 +1828,10 @@ def main():
             prompt_cue = True
             while True:
                 if pending_user_text is None:
-                    text = _listen_for_user(audio_stream, play_cue=prompt_cue)
+                    text = _listen_for_user(
+                        audio_stream, play_cue=prompt_cue, pre_roll=wake_pre_roll
+                    )
+                    wake_pre_roll = b""
                 else:
                     text = pending_user_text
                     pending_user_text = None
@@ -1788,12 +1918,14 @@ def main():
                             chunks = [reply]
 
                         stop_event = Event()
-                        interrupt_listener = Thread(
-                            target=wait_for_wake_word,
-                            args=(wake_event, stop_event, audio_stream),
-                            daemon=True,
-                        )
-                        interrupt_listener.start()
+                        interrupt_listener = None
+                        if not STT_STREAM:
+                            interrupt_listener = Thread(
+                                target=wait_for_wake_word,
+                                args=(wake_event, stop_event, audio_stream),
+                                daemon=True,
+                            )
+                            interrupt_listener.start()
 
                         interrupted = False
                         audio_queue = queue.Queue()
@@ -1848,7 +1980,8 @@ def main():
                         _stop_working_cue_loop(stop_cue_event, cue_thread)
 
                         stop_event.set()
-                        interrupt_listener.join()
+                        if interrupt_listener is not None:
+                            interrupt_listener.join()
 
                         if interrupted:
                             prompt_cue = True
