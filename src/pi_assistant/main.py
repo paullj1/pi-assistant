@@ -1373,13 +1373,23 @@ def _stt_openai_streaming_from_stream(
     recv_thread = Thread(target=_recv_loop, daemon=True)
     recv_thread.start()
 
+    send_buffer = bytearray()
+    frame_bytes = int(SAMPLE_RATE * 0.02) * 2
+
+    def _flush_buffer():
+        while len(send_buffer) >= frame_bytes:
+            frame = bytes(send_buffer[:frame_bytes])
+            del send_buffer[:frame_bytes]
+            try:
+                ws.send(frame, opcode=websocket.ABNF.OPCODE_BINARY)
+            except Exception:
+                return
+
     def _send_chunk(pcm: bytes):
         if not pcm:
             return
-        try:
-            ws.send(pcm, opcode=websocket.ABNF.OPCODE_BINARY)
-        except Exception:
-            pass
+        send_buffer.extend(pcm)
+        _flush_buffer()
 
     try:
         if pre_roll:
@@ -1411,6 +1421,11 @@ def _stt_openai_streaming_from_stream(
     finally:
         sending_done.set()
         try:
+            if send_buffer:
+                try:
+                    ws.send(bytes(send_buffer), opcode=websocket.ABNF.OPCODE_BINARY)
+                except Exception:
+                    pass
             ws.send(b"", opcode=websocket.ABNF.OPCODE_BINARY)
         except Exception:
             pass
@@ -1488,6 +1503,9 @@ class LiveWakeStreamer:
             _debug(f"wake ws connect failed: {e}")
             return
         ws.settimeout(0.5)
+        send_buffer = bytearray()
+        frame_bytes = int(SAMPLE_RATE * 0.02) * 2
+        last_rms_log = 0.0
 
         def _recv_loop():
             while not self._stop_event.is_set():
@@ -1518,14 +1536,28 @@ class LiveWakeStreamer:
                     chunk = self._audio_stream.get(timeout=0.1)
                 except queue.Empty:
                     continue
+                if DEBUG:
+                    rms = float(np.sqrt(np.mean(chunk**2))) if chunk.size else 0.0
+                    now = time.time()
+                    if now - last_rms_log >= 1.0:
+                        last_rms_log = now
+                        _debug(f"stt stream rms={rms:.4f}")
                 pcm = _process_audio_float(chunk)
                 self._append_pre_roll(pcm)
-                try:
-                    ws.send(pcm, opcode=websocket.ABNF.OPCODE_BINARY)
-                except Exception:
-                    break
+                if pcm:
+                    send_buffer.extend(pcm)
+                    while len(send_buffer) >= frame_bytes:
+                        frame = bytes(send_buffer[:frame_bytes])
+                        del send_buffer[:frame_bytes]
+                        try:
+                            ws.send(frame, opcode=websocket.ABNF.OPCODE_BINARY)
+                        except Exception:
+                            self._stop_event.set()
+                            break
         finally:
             try:
+                if send_buffer:
+                    ws.send(bytes(send_buffer), opcode=websocket.ABNF.OPCODE_BINARY)
                 ws.send(b"", opcode=websocket.ABNF.OPCODE_BINARY)
             except Exception:
                 pass
