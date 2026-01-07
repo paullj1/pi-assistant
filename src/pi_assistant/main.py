@@ -1073,7 +1073,7 @@ def _listen_for_user(
 # ----------------------------
 # Audio record + VAD
 # ----------------------------
-def _process_audio_float(audio: np.ndarray) -> bytes:
+def _process_audio_float(audio: np.ndarray, apply_noise_gate: bool = True) -> bytes:
     if audio.ndim == 2 and audio.shape[1] > 1:
         audio = np.mean(audio, axis=1, keepdims=True)
 
@@ -1085,7 +1085,7 @@ def _process_audio_float(audio: np.ndarray) -> bytes:
     if CLIP:
         audio = np.clip(audio, -1.0, 1.0)
 
-    if NOISE_GATE and NOISE_GATE > 0.0:
+    if apply_noise_gate and NOISE_GATE and NOISE_GATE > 0.0:
         audio[np.abs(audio) < NOISE_GATE] = 0.0
 
     pcm16 = (audio * 32767.0).astype(np.int16)
@@ -1146,6 +1146,7 @@ def record_until_silence_from_stream(
     threshold=RMS_THRESHOLD,
     drain=True,
     on_chunk=None,
+    apply_noise_gate: bool = True,
 ):
     chunks = []
     silence_run = 0.0
@@ -1164,7 +1165,7 @@ def record_until_silence_from_stream(
 
         chunks.append(chunk)
         if on_chunk:
-            on_chunk(_process_audio_float(chunk))
+            on_chunk(_process_audio_float(chunk, apply_noise_gate=apply_noise_gate))
         rms = float(np.sqrt(np.mean(chunk**2)))
         dt = len(chunk) / float(SAMPLE_RATE)
 
@@ -1180,7 +1181,7 @@ def record_until_silence_from_stream(
         return b""
 
     audio = np.concatenate(chunks, axis=0)
-    return _process_audio_float(audio)
+    return _process_audio_float(audio, apply_noise_gate=apply_noise_gate)
 
 
 def record_after_speech_start_from_stream(
@@ -1191,6 +1192,7 @@ def record_after_speech_start_from_stream(
     threshold: float,
     drain: bool = True,
     on_chunk=None,
+    apply_noise_gate: bool = True,
 ):
     if drain:
         audio_stream.drain()
@@ -1224,7 +1226,7 @@ def record_after_speech_start_from_stream(
 
         chunks.append(chunk)
         if on_chunk:
-            on_chunk(_process_audio_float(chunk))
+            on_chunk(_process_audio_float(chunk, apply_noise_gate=apply_noise_gate))
         silence_run = silence_run + dt if rms < threshold else 0.0
 
         elapsed = time.time() - start
@@ -1237,7 +1239,7 @@ def record_after_speech_start_from_stream(
         return b""
 
     audio = np.concatenate(chunks, axis=0)
-    return _process_audio_float(audio)
+    return _process_audio_float(audio, apply_noise_gate=apply_noise_gate)
 
 
 # ----------------------------
@@ -1383,6 +1385,8 @@ def _stt_openai_streaming_from_stream(
             try:
                 ws.send(frame, opcode=websocket.ABNF.OPCODE_BINARY)
             except Exception:
+                if DEBUG:
+                    _debug("stt stream send failed")
                 return
 
     def _send_chunk(pcm: bytes):
@@ -1403,6 +1407,7 @@ def _stt_openai_streaming_from_stream(
                 threshold=threshold,
                 drain=False,
                 on_chunk=_send_chunk,
+                apply_noise_gate=False,
             )
         else:
             pcm = record_until_silence_from_stream(
@@ -1412,6 +1417,7 @@ def _stt_openai_streaming_from_stream(
                 threshold=threshold,
                 drain=False,
                 on_chunk=_send_chunk,
+                apply_noise_gate=False,
             )
         if not pcm:
             sending_done.set()
@@ -1542,7 +1548,7 @@ class LiveWakeStreamer:
                     if now - last_rms_log >= 1.0:
                         last_rms_log = now
                         _debug(f"stt stream rms={rms:.4f}")
-                pcm = _process_audio_float(chunk)
+                pcm = _process_audio_float(chunk, apply_noise_gate=False)
                 self._append_pre_roll(pcm)
                 if pcm:
                     send_buffer.extend(pcm)
@@ -1552,6 +1558,8 @@ class LiveWakeStreamer:
                         try:
                             ws.send(frame, opcode=websocket.ABNF.OPCODE_BINARY)
                         except Exception:
+                            if DEBUG:
+                                _debug("stt stream send failed")
                             self._stop_event.set()
                             break
         finally:
