@@ -1307,7 +1307,7 @@ def _stt_openai_streaming_from_stream(
     max_seconds: float,
     silence_seconds: float,
     threshold: float,
-) -> str:
+) -> tuple[str, bytes]:
     if SAMPLE_RATE != 16000:
         _debug("streaming stt expects 16k sample rate")
 
@@ -1321,6 +1321,7 @@ def _stt_openai_streaming_from_stream(
     recv_done = Event()
     sending_done = Event()
     last_message_time = time.time()
+    pcm = b""
 
     def _recv_loop():
         nonlocal transcript, last_full, recv_error, last_message_time
@@ -1384,20 +1385,24 @@ def _stt_openai_streaming_from_stream(
             sending_done.set()
             recv_thread.join(timeout=1.0)
             ws.close()
-            return ""
+            return "", b""
     finally:
         sending_done.set()
+        try:
+            ws.send(b"", opcode=websocket.ABNF.OPCODE_BINARY)
+        except Exception:
+            pass
 
     recv_thread.join(timeout=STT_STREAM_FINAL_TIMEOUT + 1.0)
     ws.close()
     if recv_error:
         _debug(f"stt stream recv error: {recv_error}")
-    return transcript.strip()
+    return transcript.strip(), pcm
 
 
 def _listen_for_user_streaming(audio_stream: AudioStream) -> str:
     try:
-        return _stt_openai_streaming_from_stream(
+        transcript, pcm = _stt_openai_streaming_from_stream(
             audio_stream,
             WAKE_LISTEN_FULL_WINDOW,
             WAKE_LISTEN_SECONDS,
@@ -1405,6 +1410,11 @@ def _listen_for_user_streaming(audio_stream: AudioStream) -> str:
             SILENCE_SECONDS,
             RMS_THRESHOLD,
         )
+        if transcript:
+            return transcript
+        if pcm:
+            return stt_whisper(pcm)
+        return ""
     except Exception as e:
         _debug(f"stt streaming failed, falling back: {e}")
     if WAKE_LISTEN_FULL_WINDOW:
@@ -1556,27 +1566,40 @@ def wait_for_wake_word(
             f"(max={WAKE_MAX_SECONDS}s silence={WAKE_SILENCE_SECONDS}s "
             f"rms<{WAKE_RMS_THRESHOLD})"
         )
-        pcm = record_until_silence_from_stream(
-            audio_stream,
-            max_seconds=WAKE_MAX_SECONDS,
-            silence_seconds=WAKE_SILENCE_SECONDS,
-            threshold=WAKE_RMS_THRESHOLD,
-        )
-        if not pcm:
-            _debug("wake chunk empty")
-            continue
+        if STT_STREAM:
+            text, pcm = _stt_openai_streaming_from_stream(
+                audio_stream,
+                False,
+                WAKE_MAX_SECONDS,
+                WAKE_MAX_SECONDS,
+                WAKE_SILENCE_SECONDS,
+                WAKE_RMS_THRESHOLD,
+            )
+            if not pcm:
+                _debug("wake chunk empty")
+                continue
+        else:
+            pcm = record_until_silence_from_stream(
+                audio_stream,
+                max_seconds=WAKE_MAX_SECONDS,
+                silence_seconds=WAKE_SILENCE_SECONDS,
+                threshold=WAKE_RMS_THRESHOLD,
+            )
+            if not pcm:
+                _debug("wake chunk empty")
+                continue
+
+            audio_stream.pause()
+            try:
+                text = stt_whisper_wake(pcm)
+            finally:
+                audio_stream.resume()
 
         audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
         rms = float(np.sqrt(np.mean(audio**2))) if audio.size else 0.0
         if rms < WAKE_MIN_RMS_FOR_STT:
             _debug(f"wake chunk rms={rms:.4f} below stt threshold, skipping")
             continue
-
-        audio_stream.pause()
-        try:
-            text = stt_whisper_wake(pcm)
-        finally:
-            audio_stream.resume()
         if DEBUG:
             _debug(f"wake chunk rms={rms:.4f} text={text!r}")
         if text and _contains_wake_word(text):
