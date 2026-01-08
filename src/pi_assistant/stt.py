@@ -52,6 +52,19 @@ def _pcm_rms(pcm_bytes: bytes) -> float:
     return float(np.sqrt(np.mean(audio**2)))
 
 
+class KeepAliveGate:
+    def __init__(self, interval_seconds: float):
+        self._interval = interval_seconds
+        self._last_sent = 0.0
+
+    def should_send(self) -> bool:
+        now = time.time()
+        if now - self._last_sent >= self._interval:
+            self._last_sent = now
+            return True
+        return False
+
+
 def _contains_wake_word(text: str) -> bool:
     if not config.WAKE_PHRASES:
         return False
@@ -246,6 +259,7 @@ def _stt_openai_streaming_from_stream(
     send_buffer = bytearray()
     frame_bytes = int(config.SAMPLE_RATE * 0.02) * 2
     rms_gate = RMSGate(window_seconds=1.0, floor=config.RMS_THRESHOLD)
+    keepalive = KeepAliveGate(config.STT_STREAM_KEEPALIVE_SECONDS)
 
     def _flush_buffer():
         while len(send_buffer) >= frame_bytes:
@@ -262,10 +276,13 @@ def _stt_openai_streaming_from_stream(
         if not pcm_chunk:
             return
         rms_value = _pcm_rms(pcm_chunk)
-        if not rms_gate.should_send(rms_value):
+        if rms_gate.should_send(rms_value):
+            send_buffer.extend(pcm_chunk)
+            _flush_buffer()
             return
-        send_buffer.extend(pcm_chunk)
-        _flush_buffer()
+        if keepalive.should_send():
+            send_buffer.extend(pcm_chunk)
+            _flush_buffer()
 
     def _recv_loop():
         nonlocal transcript, last_full, recv_error, last_message_time
@@ -453,6 +470,7 @@ class LiveWakeStreamer:
         frame_bytes = int(config.SAMPLE_RATE * 0.02) * 2
         last_rms_log = 0.0
         rms_gate = RMSGate(window_seconds=1.0, floor=config.WAKE_RMS_THRESHOLD)
+        keepalive = KeepAliveGate(config.STT_STREAM_KEEPALIVE_SECONDS)
 
         def _recv_loop():
             while not self._stop_event.is_set():
@@ -491,7 +509,8 @@ class LiveWakeStreamer:
                         last_rms_log = now
                         debug(f"stt stream rms={rms_value:.4f}")
                 self._append_pre_roll(pcm_chunk)
-                if pcm_chunk and rms_gate.should_send(rms_value):
+                should_send = rms_gate.should_send(rms_value) or keepalive.should_send()
+                if pcm_chunk and should_send:
                     send_buffer.extend(pcm_chunk)
                     while len(send_buffer) >= frame_bytes:
                         frame = bytes(send_buffer[:frame_bytes])
