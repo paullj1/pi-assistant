@@ -70,6 +70,9 @@ class WakeWordDetector:
         if Model is None:
             raise RuntimeError("openwakeword is not available")
 
+        if config.DEBUG:
+            debug(f"wake model dir: {model_dir}")
+
         self._model = self._create_model(model_dir)
 
     def _create_model(self, model_dir: str):
@@ -80,6 +83,8 @@ class WakeWordDetector:
         if candidate is None:
             self._download_models(model_dir)
             candidate = self._find_model_path(model_dir)
+        if config.DEBUG:
+            debug(f"wake model path: {candidate or '(not found)'}")
         model_dir_kw = None
         for name in ("model_path", "models_dir", "model_dir"):
             if name in params:
@@ -93,6 +98,7 @@ class WakeWordDetector:
         device_value = config.WAKE_DEVICE
         if device_value in ("cpuexecutionprovider", "cpu_execution_provider"):
             device_value = "cpu"
+        allow_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
         candidates = []
         if "wakeword_models" in params:
@@ -101,6 +107,8 @@ class WakeWordDetector:
                 base[model_dir_kw] = model_dir
             if device_kw:
                 base[device_kw] = device_value
+            elif allow_kwargs:
+                base["device"] = device_value
             candidates.append(base)
         if "wakeword_model_paths" in params and candidate:
             base = {"wakeword_model_paths": [candidate]}
@@ -108,6 +116,8 @@ class WakeWordDetector:
                 base[model_dir_kw] = model_dir
             if device_kw:
                 base[device_kw] = device_value
+            elif allow_kwargs:
+                base["device"] = device_value
             candidates.append(base)
         if model_dir_kw or device_kw:
             base = {}
@@ -115,6 +125,8 @@ class WakeWordDetector:
                 base[model_dir_kw] = model_dir
             if device_kw:
                 base[device_kw] = device_value
+            elif allow_kwargs:
+                base["device"] = device_value
             candidates.append(base)
         candidates.append({})
 
@@ -203,7 +215,10 @@ class WakeWordDetector:
 
     def _find_model_path(self, model_dir: str) -> str | None:
         candidates = []
-        for path in self._model_search_dirs(model_dir):
+        dirs = self._model_search_dirs(model_dir)
+        if config.DEBUG:
+            debug(f"wake model search dirs: {dirs}")
+        for path in dirs:
             if not os.path.isdir(path):
                 continue
             target = f"{config.WAKE_MODEL}".lower()
