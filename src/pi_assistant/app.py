@@ -311,6 +311,10 @@ def main():
 
                 reply = (reply_msg.get("content") or "").strip()
                 reply, meta = extract_assistant_meta(reply)
+                if not meta:
+                    meta = {"done": True}
+                    if _should_end_conversation(reply):
+                        reply = reply[: -len(config.END_PROMPT)].rstrip().rstrip(".?")
                 print(f"Assistant: {reply}\n")
                 history.append({"role": "assistant", "content": reply})
                 done = bool(meta.get("done")) if isinstance(meta, dict) else False
