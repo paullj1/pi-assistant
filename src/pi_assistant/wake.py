@@ -76,14 +76,10 @@ class WakeWordDetector:
         # Try to adapt to openwakeword versions with different constructor APIs.
         sig = inspect.signature(Model)
         params = sig.parameters
-        candidate = os.path.join(model_dir, f"{config.WAKE_MODEL}.onnx")
-        if not os.path.exists(candidate):
-            try:
-                from openwakeword.utils import download_models  # type: ignore
-
-                download_models(model_dir)
-            except Exception as e:
-                debug(f"wake model download failed: {e}")
+        candidate = self._find_model_path(model_dir)
+        if candidate is None:
+            self._download_models(model_dir)
+            candidate = self._find_model_path(model_dir)
         model_dir_kw = None
         for name in ("model_path", "models_dir", "model_dir"):
             if name in params:
@@ -96,7 +92,7 @@ class WakeWordDetector:
             if model_dir_kw:
                 base[model_dir_kw] = model_dir
             candidates.append(base)
-        if "wakeword_model_paths" in params:
+        if "wakeword_model_paths" in params and candidate:
             base = {"wakeword_model_paths": [candidate]}
             if model_dir_kw:
                 base[model_dir_kw] = model_dir
@@ -125,6 +121,78 @@ class WakeWordDetector:
                 continue
 
         raise RuntimeError("Unable to initialize openwakeword model")
+
+    def _download_models(self, model_dir: str):
+        try:
+            import openwakeword
+        except Exception as e:
+            debug(f"wake model download failed: {e}")
+            return
+
+        try:
+            from openwakeword import utils  # type: ignore
+
+            if hasattr(utils, "download_models"):
+                utils.download_models([config.WAKE_MODEL], model_dir)
+                return
+        except Exception:
+            pass
+
+        def _download_file(url: str):
+            try:
+                from openwakeword import utils  # type: ignore
+
+                if hasattr(utils, "download_file"):
+                    utils.download_file(url, model_dir)
+                    return True
+            except Exception:
+                pass
+            try:
+                import requests
+
+                local_name = url.split("/")[-1]
+                out_path = os.path.join(model_dir, local_name)
+                with requests.get(url, stream=True, timeout=120) as resp:
+                    resp.raise_for_status()
+                    with open(out_path, "wb") as f:
+                        for chunk in resp.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                return True
+            except Exception as e:
+                debug(f"wake model download failed: {e}")
+                return False
+
+        os.makedirs(model_dir, exist_ok=True)
+        for model_map in ("FEATURE_MODELS", "VAD_MODELS", "MODELS"):
+            values = getattr(openwakeword, model_map, {})
+            for item in values.values():
+                url = item.get("download_url")
+                if not url:
+                    continue
+                local_name = url.split("/")[-1]
+                target = os.path.join(model_dir, local_name)
+                if not os.path.exists(target):
+                    _download_file(url)
+                if url.endswith(".tflite"):
+                    onnx_url = url.replace(".tflite", ".onnx")
+                    onnx_name = onnx_url.split("/")[-1]
+                    onnx_target = os.path.join(model_dir, onnx_name)
+                    if not os.path.exists(onnx_target):
+                        _download_file(onnx_url)
+
+    def _find_model_path(self, model_dir: str) -> str | None:
+        if not os.path.isdir(model_dir):
+            return None
+        target = f"{config.WAKE_MODEL}".lower()
+        matches = []
+        for name in os.listdir(model_dir):
+            lower = name.lower()
+            if not lower.endswith(".onnx"):
+                continue
+            if target in lower:
+                matches.append(os.path.join(model_dir, name))
+        return sorted(matches)[-1] if matches else None
 
     def _ensure_model_loaded(self, model, model_dir: str):
         if hasattr(model, "load_wakeword_models"):
