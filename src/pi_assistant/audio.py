@@ -193,13 +193,16 @@ def stop_working_cue_loop(stop_event, thread):
 class AudioStream:
     def __init__(self):
         self._queue = queue.Queue()
+        self._queues = [self._queue]
         self._status_count = 0
 
         def cb(indata, frames, time_info, status):
             if status:
                 self._status_count += 1
                 debug(f"audio callback status={status} count={self._status_count}")
-            self._queue.put(indata.copy())
+            data = indata.copy()
+            for q in list(self._queues):
+                q.put(data)
 
         self._stream = sd.InputStream(
             device=config.INPUT_DEVICE,
@@ -232,11 +235,17 @@ class AudioStream:
     def get(self, timeout=0.1):
         return self._queue.get(timeout=timeout)
 
-    def drain(self):
+    def subscribe(self) -> queue.Queue:
+        q = queue.Queue()
+        self._queues.append(q)
+        return q
+
+    def drain(self, q: queue.Queue | None = None):
+        target = q or self._queue
         drained = 0
         while True:
             try:
-                self._queue.get_nowait()
+                target.get_nowait()
                 drained += 1
             except queue.Empty:
                 break

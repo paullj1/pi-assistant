@@ -17,7 +17,8 @@ from .audio import (
 )
 from .chat import openai_chat_stream
 from .mcp import MCPManager
-from .stt import LiveWakeStreamer, stt_whisper, wait_for_wake_word
+from .stt import stt_whisper
+from .wake import WakeWordDetector
 from .tts import (
     StreamingTTS,
     play_audio,
@@ -29,17 +30,8 @@ from .tts import (
 from .utils import Turn, debug, serialize_messages
 
 
-def chat_with_streaming_tts(messages, tools, wake_event: Event, audio_stream: AudioStream):
+def chat_with_streaming_tts(messages, tools, wake_event: Event):
     stop_cue_event, cue_thread = start_working_cue_loop()
-    interrupt_stop_event = Event()
-    interrupt_listener = None
-    if not config.STT_STREAM:
-        interrupt_listener = Thread(
-            target=wait_for_wake_word,
-            args=(wake_event, interrupt_stop_event, audio_stream),
-            daemon=True,
-        )
-        interrupt_listener.start()
     stream_tts = StreamingTTS(
         wake_event, lambda: stop_working_cue_loop(stop_cue_event, cue_thread)
     )
@@ -54,9 +46,6 @@ def chat_with_streaming_tts(messages, tools, wake_event: Event, audio_stream: Au
     finally:
         stop_working_cue_loop(stop_cue_event, cue_thread)
     interrupted = stream_tts.finish()
-    interrupt_stop_event.set()
-    if interrupt_listener is not None:
-        interrupt_listener.join()
     used_stream_tts = stream_tts.used()
     return reply_msg, interrupted if used_stream_tts else False, used_stream_tts
 
@@ -158,9 +147,9 @@ def main():
     print(f"Playback:      ALSA={config.ALSA_PLAYBACK}")
     print(f"STT:           model={config.STT_MODEL}")
     print(f"STT streaming: {config.STT_STREAM}")
-    if config.STT_STREAM:
-        print(f"STT pre-roll:  {config.STT_STREAM_PRE_ROLL:.1f}s")
-    print(f"Wake word:     {', '.join(config.WAKE_PHRASES)}")
+    print(f"Wake model:    {config.WAKE_MODEL}")
+    print(f"Wake thresh:   {config.WAKE_THRESHOLD:.2f}")
+    print(f"Wake pre-roll: {config.WAKE_PRE_ROLL_SECONDS:.1f}s")
     print(f"Wake cue:      {config.WAKE_CUE}")
     print(f"Working cue:   {config.WORKING_CUE}")
     print(f"Working style:{'':1} {config.WORKING_BEEP_STYLE}")
@@ -190,35 +179,20 @@ def main():
 
     wake_event = Event()
     audio_stream = AudioStream()
-    wake_streamer = LiveWakeStreamer(audio_stream) if config.STT_STREAM else None
+    wake_detector = WakeWordDetector(audio_stream)
     wake_pre_roll = b""
 
     try:
         audio_stream.start()
+        wake_detector.start(wake_event)
         pending_wake = False
 
         while True:
             if not pending_wake:
-                if config.STT_STREAM:
-                    wake_event.clear()
-                    wake_pre_roll = b""
-                    if wake_streamer is not None:
-                        wake_streamer.start(wake_event)
-                    wake_event.wait()
-                    if wake_streamer is not None:
-                        wake_streamer.stop()
-                        wake_pre_roll = wake_streamer.get_pre_roll()
-                else:
-                    stop_event = Event()
-                    listener = Thread(
-                        target=wait_for_wake_word,
-                        args=(wake_event, stop_event, audio_stream),
-                        daemon=True,
-                    )
-                    listener.start()
-                    wake_event.wait()
-                    stop_event.set()
-                    listener.join()
+                wake_event.clear()
+                wake_pre_roll = b""
+                wake_event.wait()
+                wake_pre_roll = wake_detector.get_pre_roll()
             wake_event.clear()
             pending_wake = False
 
@@ -249,7 +223,7 @@ def main():
 
                 try:
                     reply_msg, interrupted, used_stream_tts = chat_with_streaming_tts(
-                        serialize_messages(history), mcp_tools, wake_event, audio_stream
+                        serialize_messages(history), mcp_tools, wake_event
                     )
                     while reply_msg.get("tool_calls"):
                         if not mcp_tools:
@@ -284,7 +258,6 @@ def main():
                             serialize_messages(history),
                             mcp_tools,
                             wake_event,
-                            audio_stream,
                         )
                 except requests.RequestException as e:
                     print("LLM request failed:", e)
@@ -314,16 +287,6 @@ def main():
                         chunks = split_tts_chunks(reply, config.TTS_CHUNK_CHARS)
                         if not chunks:
                             chunks = [reply]
-
-                        stop_event = Event()
-                        interrupt_listener = None
-                        if not config.STT_STREAM:
-                            interrupt_listener = Thread(
-                                target=wait_for_wake_word,
-                                args=(wake_event, stop_event, audio_stream),
-                                daemon=True,
-                            )
-                            interrupt_listener.start()
 
                         interrupted = False
                         audio_queue = queue.Queue()
@@ -377,10 +340,6 @@ def main():
 
                         stop_working_cue_loop(stop_cue_event, cue_thread)
 
-                        stop_event.set()
-                        if interrupt_listener is not None:
-                            interrupt_listener.join()
-
                         if interrupted:
                             prompt_cue = True
                             continue
@@ -406,4 +365,5 @@ def main():
     except KeyboardInterrupt:
         print("\nBye!")
     finally:
+        wake_detector.stop()
         audio_stream.stop()

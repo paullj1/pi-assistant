@@ -1,11 +1,8 @@
 import io
 import json
-import queue
 import time
 import wave
-from collections import deque
-from difflib import SequenceMatcher
-from threading import Event, Lock, Thread
+from threading import Event, Thread
 from urllib.parse import urlencode
 
 import numpy as np
@@ -19,93 +16,10 @@ from .audio import (
     record_after_speech_start_from_stream,
     record_until_silence_from_stream,
 )
-from .utils import debug, headers_auth, headers_ws, normalize_text, api_base_ws
+from .utils import debug, headers_auth, headers_ws, api_base_ws
 
 
-class RMSGate:
-    def __init__(self, window_seconds: float, floor: float):
-        self._window_frames = max(1, int(window_seconds / 0.02))
-        self._values = deque(maxlen=self._window_frames)
-        self._floor = floor
-
-    def update(self, rms: float) -> float:
-        self._values.append(rms)
-        return self.threshold()
-
-    def threshold(self) -> float:
-        if not self._values:
-            return self._floor
-        avg = sum(self._values) / len(self._values)
-        return max(self._floor, avg)
-
-    def should_send(self, rms: float) -> bool:
-        threshold = self.update(rms)
-        return rms >= threshold
-
-
-def _pcm_rms(pcm_bytes: bytes) -> float:
-    if not pcm_bytes:
-        return 0.0
-    audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-    if audio.size == 0:
-        return 0.0
-    return float(np.sqrt(np.mean(audio**2)))
-
-
-class KeepAliveGate:
-    def __init__(self, interval_seconds: float):
-        self._interval = interval_seconds
-        self._last_sent = 0.0
-
-    def should_send(self) -> bool:
-        now = time.time()
-        if now - self._last_sent >= self._interval:
-            self._last_sent = now
-            return True
-        return False
-
-
-def _contains_wake_word(text: str) -> bool:
-    if not config.WAKE_PHRASES:
-        return False
-    normalized = normalize_text(text)
-    for phrase in config.WAKE_PHRASES:
-        phrase_norm = normalize_text(phrase)
-        if phrase_norm in normalized:
-            return True
-
-        ratio = SequenceMatcher(None, normalized, phrase_norm).ratio()
-        if config.DEBUG:
-            debug(f"wake fuzzy full '{phrase_norm}' vs '{normalized}' -> {ratio:.2f}")
-        if ratio >= config.WAKE_FULL_FUZZY_THRESHOLD:
-            return True
-
-        normalized_joined = normalized.replace(" ", "")
-        phrase_joined = phrase_norm.replace(" ", "")
-        ratio = SequenceMatcher(None, normalized_joined, phrase_joined).ratio()
-        if config.DEBUG:
-            debug(
-                f"wake fuzzy join '{phrase_joined}' vs '{normalized_joined}' -> {ratio:.2f}"
-            )
-        if ratio >= config.WAKE_FULL_FUZZY_THRESHOLD:
-            return True
-
-        phrase_tokens = [
-            t for t in phrase_norm.split() if len(t) >= config.WAKE_MIN_TOKEN_LEN
-        ]
-        text_tokens = [
-            t for t in normalized.split() if len(t) >= config.WAKE_MIN_TOKEN_LEN
-        ]
-
-        for p_tok in phrase_tokens:
-            for t_tok in text_tokens:
-                ratio = SequenceMatcher(None, p_tok, t_tok).ratio()
-                if config.DEBUG:
-                    debug(f"wake fuzzy '{p_tok}' vs '{t_tok}' -> {ratio:.2f}")
-                if ratio >= config.WAKE_FUZZY_THRESHOLD:
-                    return True
-
-    return False
+from .gating import RMSGate, KeepAliveGate, pcm_rms
 
 
 def _pcm16_to_wav_bytes(pcm16_bytes: bytes) -> bytes:
@@ -154,8 +68,6 @@ def stt_whisper(pcm16_bytes: bytes) -> str:
     return _stt_openai(pcm16_bytes)
 
 
-def stt_whisper_wake(pcm16_bytes: bytes) -> str:
-    return _stt_openai(pcm16_bytes)
 
 
 def _stt_ws_url() -> str:
@@ -275,7 +187,7 @@ def _stt_openai_streaming_from_stream(
     def _send_chunk(pcm_chunk: bytes, rms: float):
         if not pcm_chunk:
             return
-        rms_value = _pcm_rms(pcm_chunk)
+        rms_value = pcm_rms(pcm_chunk)
         if rms_gate.should_send(rms_value):
             send_buffer.extend(pcm_chunk)
             _flush_buffer()
@@ -319,7 +231,7 @@ def _stt_openai_streaming_from_stream(
             while offset < len(pre_roll):
                 frame = pre_roll[offset : offset + frame_bytes]
                 offset += frame_bytes
-                _send_chunk(frame, _pcm_rms(frame))
+                _send_chunk(frame, pcm_rms(frame))
         if full_window:
             pcm = record_after_speech_start_from_stream(
                 audio_stream,
@@ -402,173 +314,7 @@ def _listen_for_user_streaming(audio_stream: AudioStream, pre_roll: bytes) -> st
     return stt_whisper(pcm)
 
 
-class LiveWakeStreamer:
-    def __init__(self, audio_stream: AudioStream):
-        self._audio_stream = audio_stream
-        self._stop_event = Event()
-        self._thread = None
-        self._recv_thread = None
-        self._wake_event = None
-        self._pre_roll = deque()
-        self._pre_roll_samples = 0
-        self._pre_roll_limit = max(0.0, config.STT_STREAM_PRE_ROLL)
-        self._transcript = ""
-        self._lock = Lock()
-
-    def start(self, wake_event: Event):
-        self._wake_event = wake_event
-        self._stop_event.clear()
-        self._thread = Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=1.0)
-        if self._recv_thread is not None:
-            self._recv_thread.join(timeout=1.0)
-
-    def is_running(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
-
-    def get_pre_roll(self) -> bytes:
-        with self._lock:
-            data = b"".join(self._pre_roll)
-        return data
-
-    def _append_pre_roll(self, pcm: bytes):
-        if self._pre_roll_limit <= 0:
-            return
-        samples = len(pcm) // 2
-        with self._lock:
-            self._pre_roll.append(pcm)
-            self._pre_roll_samples += samples
-            max_samples = int(self._pre_roll_limit * config.SAMPLE_RATE)
-            while self._pre_roll_samples > max_samples and self._pre_roll:
-                popped = self._pre_roll.popleft()
-                self._pre_roll_samples -= len(popped) // 2
-
-    def _apply_live_transcript(self, payload: dict) -> bool:
-        with self._lock:
-            self._transcript, _ = _apply_transcript_message(
-                self._transcript, payload, ""
-            )
-            if len(self._transcript) > 400:
-                self._transcript = self._transcript[-400:]
-            text = self._transcript
-        return _contains_wake_word(text)
-
-    def _run(self):
-        url = _stt_ws_url()
-        try:
-            ws = websocket.create_connection(url, header=headers_ws())
-        except Exception as e:
-            debug(f"wake ws connect failed: {e}")
-            return
-        ws.settimeout(0.5)
-        send_buffer = bytearray()
-        frame_bytes = int(config.SAMPLE_RATE * 0.02) * 2
-        last_rms_log = 0.0
-        rms_gate = RMSGate(window_seconds=1.0, floor=config.WAKE_RMS_THRESHOLD)
-        keepalive = KeepAliveGate(config.STT_STREAM_KEEPALIVE_SECONDS)
-
-        def _recv_loop():
-            while not self._stop_event.is_set():
-                try:
-                    msg = ws.recv()
-                except websocket.WebSocketTimeoutException:
-                    continue
-                except Exception:
-                    break
-                if msg is None or isinstance(msg, (bytes, bytearray)):
-                    continue
-                try:
-                    payload = json.loads(msg)
-                except Exception:
-                    continue
-                if self._apply_live_transcript(payload):
-                    if self._wake_event:
-                        self._wake_event.set()
-                    self._stop_event.set()
-                    break
-
-        self._recv_thread = Thread(target=_recv_loop, daemon=True)
-        self._recv_thread.start()
-
-        try:
-            while not self._stop_event.is_set():
-                try:
-                    chunk = self._audio_stream.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-                pcm_chunk = _process_audio_float(chunk, apply_noise_gate=False)
-                rms_value = _pcm_rms(pcm_chunk)
-                if config.DEBUG:
-                    now = time.time()
-                    if now - last_rms_log >= 1.0:
-                        last_rms_log = now
-                        debug(f"stt stream rms={rms_value:.4f}")
-                self._append_pre_roll(pcm_chunk)
-                should_send = rms_gate.should_send(rms_value) or keepalive.should_send()
-                if pcm_chunk and should_send:
-                    send_buffer.extend(pcm_chunk)
-                    while len(send_buffer) >= frame_bytes:
-                        frame = bytes(send_buffer[:frame_bytes])
-                        del send_buffer[:frame_bytes]
-                        try:
-                            ws.send(frame, opcode=websocket.ABNF.OPCODE_BINARY)
-                        except Exception:
-                            if config.DEBUG:
-                                debug("stt stream send failed")
-                            self._stop_event.set()
-                            break
-        finally:
-            try:
-                if send_buffer:
-                    ws.send(bytes(send_buffer), opcode=websocket.ABNF.OPCODE_BINARY)
-            except Exception:
-                pass
-            try:
-                ws.close()
-            except Exception:
-                pass
-
-
-def wait_for_wake_word(
-    wake_event: Event,
-    stop_event: Event,
-    audio_stream: AudioStream,
-):
-    while not stop_event.is_set():
-        debug(
-            "listening for wake word "
-            f"(max={config.WAKE_MAX_SECONDS}s silence={config.WAKE_SILENCE_SECONDS}s "
-            f"rms<{config.WAKE_RMS_THRESHOLD})"
-        )
-        pcm = record_until_silence_from_stream(
-            audio_stream,
-            max_seconds=config.WAKE_MAX_SECONDS,
-            silence_seconds=config.WAKE_SILENCE_SECONDS,
-            threshold=config.WAKE_RMS_THRESHOLD,
-        )
-        if not pcm:
-            debug("wake chunk empty")
-            continue
-
-        audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-        rms = float(np.sqrt(np.mean(audio**2))) if audio.size else 0.0
-        if rms < config.WAKE_MIN_RMS_FOR_STT:
-            debug(f"wake chunk rms={rms:.4f} below stt threshold, skipping")
-            continue
-
-        audio_stream.pause()
-        try:
-            text = stt_whisper_wake(pcm)
-        finally:
-            audio_stream.resume()
-        if config.DEBUG:
-            debug(f"wake chunk rms={rms:.4f} text={text!r}")
-        if text and _contains_wake_word(text):
-            debug("wake word detected")
-            wake_event.set()
-            return
+__all__ = [
+    "stt_whisper",
+    "_listen_for_user_streaming",
+]
