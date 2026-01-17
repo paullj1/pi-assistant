@@ -150,6 +150,7 @@ class WakeWordDetector:
             from openwakeword import utils  # type: ignore
 
             if hasattr(utils, "download_models"):
+                debug(f"wake model download: {config.WAKE_MODEL} -> {model_dir}")
                 utils.download_models([config.WAKE_MODEL], model_dir)
                 return
         except Exception:
@@ -190,26 +191,40 @@ class WakeWordDetector:
                 local_name = url.split("/")[-1]
                 target = os.path.join(model_dir, local_name)
                 if not os.path.exists(target):
+                    debug(f"wake model download: {url} -> {model_dir}")
                     _download_file(url)
                 if url.endswith(".tflite"):
                     onnx_url = url.replace(".tflite", ".onnx")
                     onnx_name = onnx_url.split("/")[-1]
                     onnx_target = os.path.join(model_dir, onnx_name)
                     if not os.path.exists(onnx_target):
+                        debug(f"wake model download: {onnx_url} -> {model_dir}")
                         _download_file(onnx_url)
 
     def _find_model_path(self, model_dir: str) -> str | None:
-        if not os.path.isdir(model_dir):
-            return None
-        target = f"{config.WAKE_MODEL}".lower()
-        matches = []
-        for name in os.listdir(model_dir):
-            lower = name.lower()
-            if not lower.endswith(".onnx"):
+        candidates = []
+        for path in self._model_search_dirs(model_dir):
+            if not os.path.isdir(path):
                 continue
-            if target in lower:
-                matches.append(os.path.join(model_dir, name))
-        return sorted(matches)[-1] if matches else None
+            target = f"{config.WAKE_MODEL}".lower()
+            for name in os.listdir(path):
+                lower = name.lower()
+                if not lower.endswith(".onnx"):
+                    continue
+                if target in lower:
+                    candidates.append(os.path.join(path, name))
+        return sorted(candidates)[-1] if candidates else None
+
+    def _model_search_dirs(self, model_dir: str) -> list[str]:
+        dirs = [model_dir]
+        try:
+            import openwakeword
+
+            pkg_dir = os.path.join(os.path.dirname(openwakeword.__file__), "resources", "models")
+            dirs.append(pkg_dir)
+        except Exception:
+            pass
+        return dirs
 
     def _ensure_model_loaded(self, model, model_dir: str):
         if hasattr(model, "load_wakeword_models"):
