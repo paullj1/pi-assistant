@@ -170,7 +170,7 @@ def _stt_openai_streaming_from_stream(
     pcm = b""
     send_buffer = bytearray()
     frame_bytes = int(config.SAMPLE_RATE * 0.02) * 2
-    rms_gate = RMSGate(window_seconds=1.0, floor=config.RMS_THRESHOLD)
+    rms_gate = RMSGate(window_seconds=1.0, floor=config.RMS_THRESHOLD, frame_seconds=0.02)
     keepalive = KeepAliveGate(config.STT_STREAM_KEEPALIVE_SECONDS)
 
     def _flush_buffer():

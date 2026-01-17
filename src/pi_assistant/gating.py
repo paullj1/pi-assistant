@@ -5,8 +5,8 @@ import numpy as np
 
 
 class RMSGate:
-    def __init__(self, window_seconds: float, floor: float):
-        self._window_frames = max(1, int(window_seconds / 0.02))
+    def __init__(self, window_seconds: float, floor: float, frame_seconds: float = 0.02):
+        self._window_frames = max(1, int(window_seconds / frame_seconds))
         self._values = deque(maxlen=self._window_frames)
         self._floor = floor
 

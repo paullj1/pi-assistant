@@ -31,6 +31,7 @@ class WakeWordDetector:
         self._rms_gate = RMSGate(
             window_seconds=config.WAKE_RMS_WINDOW_SECONDS,
             floor=config.WAKE_RMS_FLOOR,
+            frame_seconds=0.025,
         )
 
     def start(self, wake_event: Event):
@@ -76,6 +77,13 @@ class WakeWordDetector:
         sig = inspect.signature(Model)
         params = sig.parameters
         candidate = os.path.join(model_dir, f"{config.WAKE_MODEL}.onnx")
+        if not os.path.exists(candidate):
+            try:
+                from openwakeword.utils import download_models  # type: ignore
+
+                download_models(model_dir)
+            except Exception as e:
+                debug(f"wake model download failed: {e}")
         model_dir_kw = None
         for name in ("model_path", "models_dir", "model_dir"):
             if name in params:
@@ -106,13 +114,6 @@ class WakeWordDetector:
                 continue
             except Exception as e:
                 debug(f"wake model init failed: {e}")
-
-        try:
-            from openwakeword.utils import download_models  # type: ignore
-
-            download_models(model_dir)
-        except Exception as e:
-            debug(f"wake model download failed: {e}")
 
         # Last attempt with the best-known kwargs after download.
         for kwargs in candidates:
@@ -155,6 +156,9 @@ class WakeWordDetector:
                 return
 
         last_rms_log = 0.0
+        frame_samples = 400
+        frame_bytes = frame_samples * 2
+        pcm_buffer = bytearray()
 
         while not self._stop_event.is_set():
             if self._queue is None:
@@ -166,17 +170,21 @@ class WakeWordDetector:
                 continue
             pcm = _process_audio_float(chunk, apply_noise_gate=False)
             self._append_pre_roll(pcm)
-            rms_value = pcm_rms(pcm)
-            if config.DEBUG:
-                now = time.time()
-                if now - last_rms_log >= 1.0:
-                    last_rms_log = now
-                    debug(f"wake rms={rms_value:.4f}")
-            if not self._rms_gate.should_send(rms_value):
-                continue
-            audio_samples = np.frombuffer(pcm, dtype=np.int16)
-            scores = self._model.predict(audio_samples)
-            if self._should_trigger(scores) and self._cooldown_elapsed():
-                self._last_trigger = time.time()
-                if self._wake_event:
-                    self._wake_event.set()
+            pcm_buffer.extend(pcm)
+            while len(pcm_buffer) >= frame_bytes:
+                frame = bytes(pcm_buffer[:frame_bytes])
+                del pcm_buffer[:frame_bytes]
+                rms_value = pcm_rms(frame)
+                if config.DEBUG:
+                    now = time.time()
+                    if now - last_rms_log >= 1.0:
+                        last_rms_log = now
+                        debug(f"wake rms={rms_value:.4f}")
+                if not self._rms_gate.should_send(rms_value):
+                    continue
+                audio_samples = np.frombuffer(frame, dtype=np.int16)
+                scores = self._model.predict(audio_samples)
+                if self._should_trigger(scores) and self._cooldown_elapsed():
+                    self._last_trigger = time.time()
+                    if self._wake_event:
+                        self._wake_event.set()
