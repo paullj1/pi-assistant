@@ -6,7 +6,7 @@ from threading import Event, Thread
 import requests
 
 from . import config
-from .utils import extract_complete_sentences, headers_json
+from .utils import extract_assistant_meta, extract_complete_sentences, headers_json
 
 
 def synthesize_tts(text: str) -> str:
@@ -150,6 +150,7 @@ class StreamingTTS:
     def finish(self) -> bool:
         if not self._disabled and not self._aborted.is_set():
             tail = self._buffer.strip()
+            tail, _ = extract_assistant_meta(tail)
             if tail:
                 self._sentence_queue.put(tail)
         self._sentence_queue.put(None)

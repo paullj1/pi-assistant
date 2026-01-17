@@ -27,7 +27,7 @@ from .tts import (
     stop_playback,
     synthesize_tts,
 )
-from .utils import Turn, debug, serialize_messages
+from .utils import Turn, debug, extract_assistant_meta, serialize_messages
 
 
 def chat_with_streaming_tts(messages, tools, wake_event: Event):
@@ -171,9 +171,10 @@ def main():
             "'Dr.' to Doctor, 'e.g.' to 'for example', 'etc.' to 'and so on'. Spell out numbers "
             "and symbols (e.g., 1st to first, $100 to one hundred dollars, 90ºF to ninety "
             " degrees fahrenheit).  Read text naturally, ensuring clarity for the user. "
-            f"When you are done with a user's request, end by asking exactly: '{config.END_PROMPT}' "
-            "and wait for a response. If the user responds negatively (e.g., no, no thanks), "
-            "consider the conversation ended and do not ask further questions.",
+            "Decide whether the conversation should continue. If it should, end by asking exactly: "
+            f"'{config.END_PROMPT}'. If it should not, do not ask a follow-up question. "
+            "In all cases, append a final line with assistant-only metadata in JSON format like this: "
+            '<assistant_meta>{"done": true}</assistant_meta> where done=true means end the conversation.',
         )
     ]
 
@@ -275,8 +276,10 @@ def main():
                     continue
 
                 reply = (reply_msg.get("content") or "").strip()
+                reply, meta = extract_assistant_meta(reply)
                 print(f"Assistant: {reply}\n")
                 history.append({"role": "assistant", "content": reply})
+                done = bool(meta.get("done")) if isinstance(meta, dict) else False
 
                 if interrupted:
                     prompt_cue = True
@@ -343,6 +346,13 @@ def main():
                         if interrupted:
                             prompt_cue = True
                             continue
+
+                if done:
+                    try:
+                        play_stop_cue()
+                    except Exception as e:
+                        debug(f"stop cue failed: {e}")
+                    break
 
                 if _should_end_conversation(reply):
                     follow_text = _listen_for_user(audio_stream, play_cue=False)

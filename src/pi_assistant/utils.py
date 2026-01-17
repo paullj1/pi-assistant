@@ -89,3 +89,24 @@ def extract_complete_sentences(text: str) -> tuple[list[str], str]:
             sentences.append(sentence)
         start = end
     return sentences, text[start:]
+
+
+_META_PATTERN = re.compile(
+    r"\n?<assistant_meta>\s*(\{.*?\})\s*</assistant_meta>\s*$",
+    re.DOTALL,
+)
+
+
+def extract_assistant_meta(text: str) -> tuple[str, dict]:
+    match = _META_PATTERN.search(text)
+    if not match:
+        return text, {}
+    meta_raw = match.group(1)
+    cleaned = _META_PATTERN.sub("", text).rstrip()
+    try:
+        meta = json.loads(meta_raw)
+        if isinstance(meta, dict):
+            return cleaned, meta
+    except Exception:
+        pass
+    return cleaned, {}
