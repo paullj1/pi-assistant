@@ -387,10 +387,15 @@ def main():
                     break
 
                 if _should_end_conversation(reply):
-                    follow_text = _listen_for_user(audio_stream, play_cue=False)
+                    follow_text = _listen_for_user(
+                        audio_stream,
+                        play_cue=False,
+                        max_wait_seconds=config.FOLLOWUP_WAIT_SECONDS,
+                    )
                     if not follow_text:
                         try:
-                            play_stop_cue()
+                            proc = speak_async(config.FOLLOWUP_NO_RESPONSE_TTS)
+                            proc.wait()
                         except Exception as e:
                             debug(f"stop cue failed: {e}")
                         break
