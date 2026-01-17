@@ -95,9 +95,16 @@ class WakeWordDetector:
             if name in params:
                 device_kw = name
                 break
+        if device_kw is None:
+            for name in ("inference_framework",):
+                if name in params:
+                    device_kw = name
+                    break
         device_value = config.WAKE_DEVICE
         if device_value in ("cpuexecutionprovider", "cpu_execution_provider"):
             device_value = "cpu"
+        if device_kw == "inference_framework":
+            device_value = "onnx" if device_value == "cpu" else device_value
         allow_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
         candidates = []
