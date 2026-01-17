@@ -275,12 +275,18 @@ def _stt_openai_streaming_from_stream(
     return transcript.strip(), pcm
 
 
-def _listen_for_user_streaming(audio_stream: AudioStream, pre_roll: bytes) -> str:
+def _listen_for_user_streaming(
+    audio_stream: AudioStream, pre_roll: bytes, max_wait_seconds: float | None
+) -> str:
     try:
+        full_window = config.WAKE_LISTEN_FULL_WINDOW if max_wait_seconds is None else True
+        wait_seconds = (
+            config.WAKE_LISTEN_SECONDS if max_wait_seconds is None else max_wait_seconds
+        )
         transcript, pcm = _stt_openai_streaming_from_stream(
             audio_stream,
-            config.WAKE_LISTEN_FULL_WINDOW,
-            config.WAKE_LISTEN_SECONDS,
+            full_window,
+            wait_seconds,
             config.WAKE_LISTEN_SECONDS,
             config.SILENCE_SECONDS,
             config.RMS_THRESHOLD,

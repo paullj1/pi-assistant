@@ -50,7 +50,12 @@ def chat_with_streaming_tts(messages, tools, wake_event: Event):
     return reply_msg, interrupted if used_stream_tts else False, used_stream_tts
 
 
-def _listen_for_user(audio_stream: AudioStream, play_cue: bool, pre_roll: bytes = b"") -> str:
+def _listen_for_user(
+    audio_stream: AudioStream,
+    play_cue: bool,
+    pre_roll: bytes = b"",
+    max_wait_seconds: float | None = None,
+) -> str:
     if play_cue:
         try:
             play_wake_cue()
@@ -60,9 +65,20 @@ def _listen_for_user(audio_stream: AudioStream, play_cue: bool, pre_roll: bytes 
     if config.STT_STREAM:
         from .stt import _listen_for_user_streaming
 
-        return _listen_for_user_streaming(audio_stream, pre_roll)
+        return _listen_for_user_streaming(audio_stream, pre_roll, max_wait_seconds)
 
-    if config.WAKE_LISTEN_FULL_WINDOW:
+    if max_wait_seconds is not None:
+        from .audio import record_after_speech_start_from_stream
+
+        pcm = record_after_speech_start_from_stream(
+            audio_stream,
+            max_wait_seconds=max_wait_seconds,
+            max_seconds=config.WAKE_LISTEN_SECONDS,
+            silence_seconds=config.SILENCE_SECONDS,
+            threshold=config.RMS_THRESHOLD,
+            drain=False,
+        )
+    elif config.WAKE_LISTEN_FULL_WINDOW:
         from .audio import record_after_speech_start_from_stream
 
         pcm = record_after_speech_start_from_stream(
@@ -201,10 +217,26 @@ def main():
             prompt_cue = True
             while True:
                 if pending_user_text is None:
-                    text = _listen_for_user(
-                        audio_stream, play_cue=prompt_cue, pre_roll=wake_pre_roll
-                    )
-                    wake_pre_roll = b""
+                    if prompt_cue:
+                        one_shot = _listen_for_user(
+                            audio_stream,
+                            play_cue=False,
+                            pre_roll=wake_pre_roll,
+                            max_wait_seconds=config.WAKE_ONE_SHOT_GRACE_SECONDS,
+                        )
+                        wake_pre_roll = b""
+                        if one_shot:
+                            text = one_shot
+                            prompt_cue = False
+                        else:
+                            text = _listen_for_user(
+                                audio_stream, play_cue=True, pre_roll=b""
+                            )
+                    else:
+                        text = _listen_for_user(
+                            audio_stream, play_cue=prompt_cue, pre_roll=wake_pre_roll
+                        )
+                        wake_pre_roll = b""
                 else:
                     text = pending_user_text
                     pending_user_text = None
