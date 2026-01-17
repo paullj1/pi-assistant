@@ -1,3 +1,4 @@
+import inspect
 import os
 import time
 from collections import deque
@@ -5,7 +6,10 @@ from threading import Event, Thread
 
 import numpy as np
 
-from openwakeword.model import Model
+try:
+    from openwakeword.model import Model
+except Exception:  # pragma: no cover
+    Model = None
 
 from . import config
 from .audio import AudioStream, _process_audio_float
@@ -62,10 +66,76 @@ class WakeWordDetector:
     def _load_model(self):
         model_dir = os.path.expanduser(config.WAKE_MODEL_DIR)
         os.makedirs(model_dir, exist_ok=True)
-        self._model = Model(
-            wakeword_models=[config.WAKE_MODEL],
-            model_path=model_dir,
-        )
+        if Model is None:
+            raise RuntimeError("openwakeword is not available")
+
+        self._model = self._create_model(model_dir)
+
+    def _create_model(self, model_dir: str):
+        # Try to adapt to openwakeword versions with different constructor APIs.
+        sig = inspect.signature(Model)
+        params = sig.parameters
+        candidate = os.path.join(model_dir, f"{config.WAKE_MODEL}.onnx")
+        model_dir_kw = None
+        for name in ("model_path", "models_dir", "model_dir"):
+            if name in params:
+                model_dir_kw = name
+                break
+
+        candidates = []
+        if "wakeword_models" in params:
+            base = {"wakeword_models": [config.WAKE_MODEL]}
+            if model_dir_kw:
+                base[model_dir_kw] = model_dir
+            candidates.append(base)
+        if "wakeword_model_paths" in params:
+            base = {"wakeword_model_paths": [candidate]}
+            if model_dir_kw:
+                base[model_dir_kw] = model_dir
+            candidates.append(base)
+        if model_dir_kw:
+            candidates.append({model_dir_kw: model_dir})
+        candidates.append({})
+
+        for kwargs in candidates:
+            try:
+                model = Model(**kwargs)
+                self._ensure_model_loaded(model, model_dir)
+                return model
+            except TypeError:
+                continue
+            except Exception as e:
+                debug(f"wake model init failed: {e}")
+
+        try:
+            from openwakeword.utils import download_models  # type: ignore
+
+            download_models(model_dir)
+        except Exception as e:
+            debug(f"wake model download failed: {e}")
+
+        # Last attempt with the best-known kwargs after download.
+        for kwargs in candidates:
+            try:
+                model = Model(**kwargs)
+                self._ensure_model_loaded(model, model_dir)
+                return model
+            except Exception:
+                continue
+
+        raise RuntimeError("Unable to initialize openwakeword model")
+
+    def _ensure_model_loaded(self, model, model_dir: str):
+        if hasattr(model, "load_wakeword_models"):
+            try:
+                model.load_wakeword_models([config.WAKE_MODEL], model_dir=model_dir)
+            except Exception:
+                pass
+        if hasattr(model, "set_wakeword_models"):
+            try:
+                model.set_wakeword_models([config.WAKE_MODEL])
+            except Exception:
+                pass
 
     def _should_trigger(self, scores: dict) -> bool:
         score = scores.get(config.WAKE_MODEL, 0.0)
