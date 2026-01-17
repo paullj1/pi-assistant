@@ -106,6 +106,7 @@ class WakeWordDetector:
         if device_kw == "inference_framework":
             device_value = "onnx" if device_value == "cpu" else device_value
         allow_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        prefers_onnx = bool(candidate and candidate.endswith(".onnx"))
 
         candidates = []
         if "wakeword_models" in params:
@@ -116,6 +117,8 @@ class WakeWordDetector:
                 base[device_kw] = device_value
             elif allow_kwargs:
                 base["device"] = device_value
+                if prefers_onnx:
+                    base["inference_framework"] = "onnx"
             candidates.append(base)
         if "wakeword_model_paths" in params and candidate:
             base = {"wakeword_model_paths": [candidate]}
@@ -125,6 +128,8 @@ class WakeWordDetector:
                 base[device_kw] = device_value
             elif allow_kwargs:
                 base["device"] = device_value
+                if prefers_onnx:
+                    base["inference_framework"] = "onnx"
             candidates.append(base)
         if model_dir_kw or device_kw:
             base = {}
@@ -134,6 +139,13 @@ class WakeWordDetector:
                 base[device_kw] = device_value
             elif allow_kwargs:
                 base["device"] = device_value
+                if prefers_onnx:
+                    base["inference_framework"] = "onnx"
+            candidates.append(base)
+        if allow_kwargs:
+            base = {"device": device_value}
+            if prefers_onnx:
+                base["inference_framework"] = "onnx"
             candidates.append(base)
         candidates.append({})
 
