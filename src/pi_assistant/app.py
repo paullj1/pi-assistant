@@ -12,6 +12,7 @@ from .audio import (
     play_stop_cue,
     play_wake_cue,
     print_audio_devices,
+    record_after_speech_start_from_stream,
     start_working_cue_loop,
     stop_working_cue_loop,
 )
@@ -189,6 +190,7 @@ def main():
             " degrees fahrenheit).  Read text naturally, ensuring clarity for the user. "
             "Decide whether the conversation should continue. If it should, end by asking exactly: "
             f"'{config.END_PROMPT}'. If it should not, do not ask a follow-up question. "
+            "Default to done=true for straightforward, one-shot requests. "
             "In all cases, append a final line with assistant-only metadata in JSON format like this: "
             '<assistant_meta>{"done": true}</assistant_meta> where done=true means end the conversation.',
         )
@@ -387,11 +389,15 @@ def main():
                     break
 
                 if _should_end_conversation(reply):
-                    follow_text = _listen_for_user(
+                    pcm = record_after_speech_start_from_stream(
                         audio_stream,
-                        play_cue=False,
                         max_wait_seconds=config.FOLLOWUP_WAIT_SECONDS,
+                        max_seconds=config.WAKE_LISTEN_SECONDS,
+                        silence_seconds=config.SILENCE_SECONDS,
+                        threshold=config.RMS_THRESHOLD,
+                        drain=False,
                     )
+                    follow_text = stt_whisper(pcm) if pcm else ""
                     if not follow_text:
                         try:
                             proc = speak_async(config.FOLLOWUP_NO_RESPONSE_TTS)
