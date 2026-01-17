@@ -85,20 +85,37 @@ class WakeWordDetector:
             if name in params:
                 model_dir_kw = name
                 break
+        device_kw = None
+        for name in ("device", "inference_device"):
+            if name in params:
+                device_kw = name
+                break
+        device_value = config.WAKE_DEVICE
+        if device_value in ("cpuexecutionprovider", "cpu_execution_provider"):
+            device_value = "cpu"
 
         candidates = []
         if "wakeword_models" in params:
             base = {"wakeword_models": [config.WAKE_MODEL]}
             if model_dir_kw:
                 base[model_dir_kw] = model_dir
+            if device_kw:
+                base[device_kw] = device_value
             candidates.append(base)
         if "wakeword_model_paths" in params and candidate:
             base = {"wakeword_model_paths": [candidate]}
             if model_dir_kw:
                 base[model_dir_kw] = model_dir
+            if device_kw:
+                base[device_kw] = device_value
             candidates.append(base)
-        if model_dir_kw:
-            candidates.append({model_dir_kw: model_dir})
+        if model_dir_kw or device_kw:
+            base = {}
+            if model_dir_kw:
+                base[model_dir_kw] = model_dir
+            if device_kw:
+                base[device_kw] = device_value
+            candidates.append(base)
         candidates.append({})
 
         for kwargs in candidates:
