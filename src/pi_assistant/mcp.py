@@ -4,6 +4,8 @@ import subprocess
 import time
 from threading import Condition, Lock, Thread
 
+import requests
+
 from .utils import debug
 
 
@@ -119,6 +121,68 @@ class MCPServer:
         return resp.get("result", {})
 
 
+class MCPHttpServer:
+    def __init__(self, name: str, config: dict):
+        self._name = name
+        self._config = config
+        self._next_id = 1
+
+    def list_tools(self):
+        resp = self._request("tools/list")
+        return resp.get("result", {}).get("tools", [])
+
+    def call_tool(self, name: str, arguments: dict):
+        resp = self._request("tools/call", {"name": name, "arguments": arguments})
+        return resp.get("result", {})
+
+    def _request(self, method: str, params: dict | None = None, timeout=30):
+        req_id = self._next_id
+        self._next_id += 1
+        payload = {"jsonrpc": "2.0", "id": req_id, "method": method}
+        if params is not None:
+            payload["params"] = params
+
+        url = self._config.get("url", "").strip()
+        if not url:
+            raise RuntimeError(f"MCP http server {self._name} missing url")
+        headers = dict(self._config.get("headers", {}))
+        if "Content-Type" not in headers:
+            headers["Content-Type"] = "application/json"
+        timeout_s = float(self._config.get("timeout", timeout))
+        r = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=timeout_s,
+            stream=True,
+        )
+        r.raise_for_status()
+        content_type = r.headers.get("Content-Type", "")
+        if "text/event-stream" in content_type:
+            last_msg = None
+            for raw_line in r.iter_lines(decode_unicode=True):
+                if not raw_line:
+                    continue
+                line = raw_line.strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    msg = json.loads(data)
+                except Exception:
+                    continue
+                last_msg = msg
+                if msg.get("id") == req_id and ("result" in msg or "error" in msg):
+                    break
+            if last_msg is None:
+                raise RuntimeError("empty MCP stream response")
+            return last_msg
+
+        return r.json()
+
+
 class MCPManager:
     def __init__(self, config_path: str):
         self._config_path = config_path
@@ -145,12 +209,16 @@ class MCPManager:
         for name, srv in servers.items():
             try:
                 transport = srv.get("transport", "stdio")
-                if transport != "stdio":
+                if transport == "stdio":
+                    server = MCPServer(name, srv)
+                    server.start()
+                    self._servers[name] = server
+                elif transport == "streamable-http":
+                    server = MCPHttpServer(name, srv)
+                    self._servers[name] = server
+                else:
                     debug(f"mcp server {name} unsupported transport: {transport}")
                     continue
-                server = MCPServer(name, srv)
-                server.start()
-                self._servers[name] = server
             except Exception as e:
                 debug(f"mcp server {name} failed to start: {e}")
 
