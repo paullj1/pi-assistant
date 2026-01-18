@@ -2,6 +2,7 @@ import argparse
 import json
 import queue
 import time
+from datetime import datetime
 from threading import Event, Thread
 
 import requests
@@ -29,6 +30,23 @@ from .tts import (
     synthesize_tts,
 )
 from .utils import Turn, debug, extract_assistant_meta, serialize_messages
+
+
+def _system_prompt() -> str:
+    now_str = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    return (
+        "You are a helpful voice assistant. Keep replies concise and conversational. "
+        f"Current date/time: {now_str}. "
+        "Normalize your text for TTS.  Expand abbreviations like 'Ave.' to 'Avenue', "
+        "'Dr.' to Doctor, 'e.g.' to 'for example', 'etc.' to 'and so on'. Spell out numbers "
+        "and symbols (e.g., 1st to first, $100 to one hundred dollars, 90ºF to ninety "
+        " degrees fahrenheit).  Read text naturally, ensuring clarity for the user. "
+        "Decide whether the conversation should continue. If it should, end by asking exactly: "
+        f"'{config.END_PROMPT}'. If it should not, do not ask a follow-up question. "
+        "Default to done=true for straightforward, one-shot requests. "
+        "In all cases, append a final line with assistant-only metadata in JSON format like this: "
+        '<assistant_meta>{"done": true}</assistant_meta> where done=true means end the conversation.'
+    )
 
 
 def chat_with_streaming_tts(messages, tools, wake_event: Event):
@@ -183,16 +201,7 @@ def main():
     history = [
         Turn(
             "system",
-            "You are a helpful voice assistant. Keep replies concise and conversational. "
-            "Normalize your text for TTS.  Expand abbreviations like 'Ave.' to 'Avenue', "
-            "'Dr.' to Doctor, 'e.g.' to 'for example', 'etc.' to 'and so on'. Spell out numbers "
-            "and symbols (e.g., 1st to first, $100 to one hundred dollars, 90ºF to ninety "
-            " degrees fahrenheit).  Read text naturally, ensuring clarity for the user. "
-            "Decide whether the conversation should continue. If it should, end by asking exactly: "
-            f"'{config.END_PROMPT}'. If it should not, do not ask a follow-up question. "
-            "Default to done=true for straightforward, one-shot requests. "
-            "In all cases, append a final line with assistant-only metadata in JSON format like this: "
-            '<assistant_meta>{"done": true}</assistant_meta> where done=true means end the conversation.',
+            _system_prompt(),
         )
     ]
 
@@ -255,6 +264,7 @@ def main():
 
                 print(f"You: {text}")
                 history.append(Turn("user", text))
+                history[0] = Turn("system", _system_prompt())
 
                 try:
                     reply_msg, interrupted, used_stream_tts = chat_with_streaming_tts(
@@ -289,10 +299,12 @@ def main():
                                     "content": result,
                                 }
                             )
-                        reply_msg, interrupted, used_stream_tts = chat_with_streaming_tts(
-                            serialize_messages(history),
-                            mcp_tools,
-                            wake_event,
+                        reply_msg, interrupted, used_stream_tts = (
+                            chat_with_streaming_tts(
+                                serialize_messages(history),
+                                mcp_tools,
+                                wake_event,
+                            )
                         )
                 except requests.RequestException as e:
                     print("LLM request failed:", e)
