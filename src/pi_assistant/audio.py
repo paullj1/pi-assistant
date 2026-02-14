@@ -115,6 +115,18 @@ def _play_cue(mode: str, tts_text: str, beep_key: str, hz: float, ms: int, gain:
         return
 
 
+def play_wake_detect_beep():
+    """Play immediate beep when wake word is detected (quick feedback)"""
+    _play_cue(
+        config.WAKE_DETECT_BEEP,
+        "",
+        "wake_detect_beep",
+        config.WAKE_DETECT_BEEP_HZ,
+        config.WAKE_DETECT_BEEP_MS,
+        config.WAKE_DETECT_BEEP_GAIN,
+    )
+
+
 def play_wake_cue():
     _play_cue(
         config.WAKE_CUE,

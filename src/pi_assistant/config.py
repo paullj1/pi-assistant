@@ -136,22 +136,6 @@ WORKING_BEEP_STYLE = _as_str("ASSISTANT_WORKING_BEEP_STYLE", "sequence").strip()
 WORKING_BEEP_HZ2 = _as_float("ASSISTANT_WORKING_BEEP_HZ2", 380.0)
 WORKING_BEEP_HZ3 = _as_float("ASSISTANT_WORKING_BEEP_HZ3", 450.0)
 
-# Conversation end detection
-END_PROMPT = "Anything else?"
-END_USER_RESPONSES = {
-    "no",
-    "nope",
-    "nah",
-    "no thanks",
-    "no thank you",
-    "that's all",
-    "that is all",
-    "that's it",
-    "that is it",
-    "all done",
-    "done",
-}
-
 # Debug logging
 DEBUG = _as_bool("ASSISTANT_DEBUG", False)
 
@@ -167,8 +151,9 @@ WAKE_RMS_FLOOR = _as_float("ASSISTANT_WAKE_RMS_FLOOR", 0.001)
 WAKE_RMS_WINDOW_SECONDS = _as_float("ASSISTANT_WAKE_RMS_WINDOW_SECONDS", 1.0)
 WAKE_DEVICE = _as_str("ASSISTANT_WAKE_DEVICE", "cpu").strip().lower()
 WAKE_ONE_SHOT_GRACE_SECONDS = _as_float("ASSISTANT_WAKE_ONE_SHOT_GRACE_SECONDS", 0.8)
-FOLLOWUP_WAIT_SECONDS = _as_float("ASSISTANT_FOLLOWUP_WAIT_SECONDS", 2.5)
-FOLLOWUP_NO_RESPONSE_TTS = _as_str(
-    "ASSISTANT_FOLLOWUP_NO_RESPONSE_TTS",
-    "Alright, just let me know if you need anything.",
-).strip()
+
+# Wake detection feedback (immediate beep when wake word detected)
+WAKE_DETECT_BEEP = _as_str("ASSISTANT_WAKE_DETECT_BEEP", "beep").strip().lower()
+WAKE_DETECT_BEEP_HZ = _as_float("ASSISTANT_WAKE_DETECT_BEEP_HZ", 1000.0)
+WAKE_DETECT_BEEP_MS = _as_int("ASSISTANT_WAKE_DETECT_BEEP_MS", 60)
+WAKE_DETECT_BEEP_GAIN = _as_float("ASSISTANT_WAKE_DETECT_BEEP_GAIN", 0.25)

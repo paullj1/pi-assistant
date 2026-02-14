@@ -12,6 +12,7 @@ from .audio import (
     AudioStream,
     play_stop_cue,
     play_wake_cue,
+    play_wake_detect_beep,
     print_audio_devices,
     record_after_speech_start_from_stream,
     start_working_cue_loop,
@@ -41,8 +42,8 @@ def _system_prompt() -> str:
         "'Dr.' to Doctor, 'e.g.' to 'for example', 'etc.' to 'and so on'. Spell out numbers "
         "and symbols (e.g., 1st to first, $100 to one hundred dollars, 90ºF to ninety "
         " degrees fahrenheit).  Read text naturally, ensuring clarity for the user. "
-        "Decide whether the conversation should continue. If it should, end by asking exactly: "
-        f"'{config.END_PROMPT}'. If it should not, do not ask a follow-up question. "
+        "Decide whether the conversation should continue. If it should, ask a brief follow-up "
+        "question. If it should not, do not ask a follow-up question. "
         "Default to done=true for straightforward, one-shot requests. "
         "In all cases, append a final line with assistant-only metadata in JSON format like this: "
         '<assistant_meta>{"done": true}</assistant_meta> where done=true means end the conversation.'
@@ -125,19 +126,6 @@ def _listen_for_user(
     return stt_whisper(pcm)
 
 
-def _should_end_conversation(reply: str) -> bool:
-    from .utils import normalize_text
-
-    return normalize_text(reply).endswith(normalize_text(config.END_PROMPT))
-
-
-def _is_user_done(text: str) -> bool:
-    from .utils import normalize_text
-
-    normalized = normalize_text(text)
-    return normalized in config.END_USER_RESPONSES
-
-
 def main():
     parser = argparse.ArgumentParser(description="Pi Assistant")
     parser.add_argument(
@@ -185,6 +173,7 @@ def main():
     print(f"Wake model:    {config.WAKE_MODEL}")
     print(f"Wake thresh:   {config.WAKE_THRESHOLD:.2f}")
     print(f"Wake pre-roll: {config.WAKE_PRE_ROLL_SECONDS:.1f}s")
+    print(f"Wake detect:   {config.WAKE_DETECT_BEEP}")
     print(f"Wake cue:      {config.WAKE_CUE}")
     print(f"Working cue:   {config.WORKING_CUE}")
     print(f"Working style:{'':1} {config.WORKING_BEEP_STYLE}")
@@ -221,6 +210,11 @@ def main():
                 wake_pre_roll = b""
                 wake_event.wait()
                 wake_pre_roll = wake_detector.get_pre_roll()
+                # Play immediate feedback beep when wake word detected
+                try:
+                    play_wake_detect_beep()
+                except Exception as e:
+                    debug(f"wake detect beep failed: {e}")
             wake_event.clear()
             pending_wake = False
 
@@ -266,10 +260,16 @@ def main():
                 history.append(Turn("user", text))
                 history[0] = Turn("system", _system_prompt())
 
+                # Start working cue immediately after user finishes speaking
+                outer_stop_cue_event, outer_cue_thread = start_working_cue_loop()
                 try:
                     reply_msg, interrupted, used_stream_tts = chat_with_streaming_tts(
                         serialize_messages(history), mcp_tools, wake_event
                     )
+                finally:
+                    stop_working_cue_loop(outer_stop_cue_event, outer_cue_thread)
+
+                try:
                     while reply_msg.get("tool_calls"):
                         if not mcp_tools:
                             debug("model requested tools but none are configured")
@@ -299,13 +299,18 @@ def main():
                                     "content": result,
                                 }
                             )
-                        reply_msg, interrupted, used_stream_tts = (
-                            chat_with_streaming_tts(
-                                serialize_messages(history),
-                                mcp_tools,
-                                wake_event,
+                        # Start working cue for tool follow-up
+                        outer_stop_cue_event, outer_cue_thread = start_working_cue_loop()
+                        try:
+                            reply_msg, interrupted, used_stream_tts = (
+                                chat_with_streaming_tts(
+                                    serialize_messages(history),
+                                    mcp_tools,
+                                    wake_event,
+                                )
                             )
-                        )
+                        finally:
+                            stop_working_cue_loop(outer_stop_cue_event, outer_cue_thread)
                 except requests.RequestException as e:
                     print("LLM request failed:", e)
                     try:
@@ -325,8 +330,6 @@ def main():
                 reply, meta = extract_assistant_meta(reply)
                 if not meta:
                     meta = {"done": True}
-                    if _should_end_conversation(reply):
-                        reply = reply[: -len(config.END_PROMPT)].rstrip().rstrip(".?")
                 print(f"Assistant: {reply}\n")
                 history.append({"role": "assistant", "content": reply})
                 done = bool(meta.get("done")) if isinstance(meta, dict) else False
@@ -403,33 +406,6 @@ def main():
                     except Exception as e:
                         debug(f"stop cue failed: {e}")
                     break
-
-                if _should_end_conversation(reply):
-                    pcm = record_after_speech_start_from_stream(
-                        audio_stream,
-                        max_wait_seconds=config.FOLLOWUP_WAIT_SECONDS,
-                        max_seconds=config.WAKE_LISTEN_SECONDS,
-                        silence_seconds=config.SILENCE_SECONDS,
-                        threshold=config.RMS_THRESHOLD,
-                        drain=False,
-                    )
-                    follow_text = stt_whisper(pcm) if pcm else ""
-                    if not follow_text:
-                        try:
-                            proc = speak_async(config.FOLLOWUP_NO_RESPONSE_TTS)
-                            proc.wait()
-                        except Exception as e:
-                            debug(f"stop cue failed: {e}")
-                        break
-                    if _is_user_done(follow_text):
-                        try:
-                            play_stop_cue()
-                        except Exception as e:
-                            debug(f"stop cue failed: {e}")
-                        break
-
-                    pending_user_text = follow_text
-                    prompt_cue = False
 
     except KeyboardInterrupt:
         print("\nBye!")
